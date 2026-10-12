@@ -1,0 +1,34 @@
+{
+  "name": "worktreekill",
+  "version": "0.0.0",
+  "description": "Find and delete git worktrees across your machine, with size and last used. Like npkill, for worktrees.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ConstantinChirila/worktree-kill.git"
+  },
+  "homepage": "https://github.com/ConstantinChirila/worktree-kill#readme",
+  "bugs": "https://github.com/ConstantinChirila/worktree-kill/issues",
+  "bin": {
+    "worktreekill": "bin/worktreekill.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "keywords": [
+    "git",
+    "worktree",
+    "cleanup",
+    "disk",
+    "npkill",
+    "claude-code",
+    "cursor",
+    "codex",
+    "tui"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {}
+}
