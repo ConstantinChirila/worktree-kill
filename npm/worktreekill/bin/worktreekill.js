@@ -3,15 +3,15 @@
 // alongside this one (via optionalDependencies, filtered by os/cpu).
 "use strict";
 
-const { spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const { exeName, packageName } = require("../lib/platform.js");
 
-const pkg = `worktreekill-${process.platform}-${process.arch}`;
-const exe = process.platform === "win32" ? "worktreekill.exe" : "worktreekill";
+const pkg = packageName(process.platform, process.arch);
 
 let binary;
 try {
-	binary = require.resolve(`${pkg}/bin/${exe}`);
+	binary = require.resolve(`${pkg}/bin/${exeName(process.platform)}`);
 } catch {
 	console.error(
 		`worktreekill: no prebuilt binary for ${process.platform}-${process.arch}.\n` +
@@ -34,14 +34,30 @@ if (process.platform !== "win32") {
 	}
 }
 
-const result = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
-if (result.error) {
-	console.error(`worktreekill: failed to start ${binary}: ${result.error.message}`);
+const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
+
+// Pass signals sent to the launcher on to the binary. Ctrl+C in a terminal
+// already reaches both, so the launcher only has to survive it and wait.
+const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+for (const signal of signals) {
+	process.on(signal, () => {
+		if (signal !== "SIGINT") child.kill(signal);
+	});
+}
+
+child.on("error", (err) => {
+	console.error(`worktreekill: failed to start ${binary}: ${err.message}`);
 	process.exit(1);
-}
+});
 
-if (result.signal) {
-	process.kill(process.pid, result.signal);
-}
+child.on("exit", (code, signal) => {
+	if (signal) {
+		// Exit the same way, so the shell sees the signal: drop the handlers
+		// above so the default action (terminate) runs.
+		for (const s of signals) process.removeAllListeners(s);
+		process.kill(process.pid, signal);
+		return;
+	}
 
-process.exit(result.status ?? 1);
+	process.exit(code ?? 1);
+});

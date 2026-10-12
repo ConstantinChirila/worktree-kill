@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Builds the npm packages into dist/npm/:
 //   worktreekill                 launcher, depends on all platform packages
-//   worktreekill-<os>-<arch>     one prebuilt Go binary each
+//   @worktreekill/<os>-<arch>    one prebuilt Go binary each
 //
 // Usage: node scripts/build-npm.mjs <version>
 // Publishing is a separate, manual step (see the printed commands).
@@ -10,6 +10,8 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import platform from "../npm/worktreekill/lib/platform.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = join(root, "dist", "npm");
@@ -35,9 +37,9 @@ launcher.version = version;
 launcher.optionalDependencies = {};
 
 for (const t of targets) {
-	const name = `worktreekill-${t.os}-${t.cpu}`;
-	const dir = join(out, name);
-	const exe = t.os === "win32" ? "worktreekill.exe" : "worktreekill";
+	const name = platform.packageName(t.os, t.cpu);
+	const dir = join(out, `${t.os}-${t.cpu}`);
+	const exe = platform.exeName(t.os);
 	mkdirSync(join(dir, "bin"), { recursive: true });
 
 	console.log(`building ${name}`);
@@ -68,5 +70,5 @@ cpSync(join(root, "README.md"), join(launcherDir, "README.md"));
 writeFileSync(join(launcherDir, "package.json"), JSON.stringify(launcher, null, 2) + "\n");
 
 console.log(`\nBuilt ${targets.length + 1} packages in dist/npm. To publish (platform packages first):`);
-for (const t of targets) console.log(`  npm publish dist/npm/worktreekill-${t.os}-${t.cpu} --access public`);
+for (const t of targets) console.log(`  npm publish dist/npm/${t.os}-${t.cpu} --access public`);
 console.log("  npm publish dist/npm/worktreekill --access public");
