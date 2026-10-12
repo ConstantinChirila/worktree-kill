@@ -21,7 +21,7 @@ Results appear as they're found. Size and status fill in as they're calculated.
 
 ## Where it looks
 
-With no arguments it scans your home folder. It skips hidden folders, `node_modules`, `bower_components`, `Pods`, `DerivedData`, and `~/Library`, `~/Applications`, `~/Movies`, `~/Music`, `~/Pictures`. It also scans the places tools keep worktrees:
+With no arguments it scans your home folder. It skips hidden folders, `node_modules`, `bower_components`, `Pods`, `DerivedData`, Go's module cache (`~/go/pkg`), and `~/Library`, `~/Applications`, `~/Movies`, `~/Music`, `~/Pictures`, `~/OrbStack`, `~/miniconda3`, `~/anaconda3`, `~/miniforge3`. It also scans the places tools keep worktrees:
 
 - `~/.claude-worktrees`, `<repo>/.claude/worktrees` (Claude Code)
 - `~/.cursor/worktrees` (Cursor)
@@ -49,11 +49,11 @@ Worktrees registered in any repo it finds are listed wherever they live on disk.
 
 ## How deletion works
 
-- A worktree can't be deleted until its git status has loaded, so the prompt can warn about everything that would be lost: uncommitted changes, commits on no branch (detached HEAD), locks, and selected rows the filter hides.
+- A worktree can't be deleted until its git status has loaded, so the prompt can warn about everything that would be lost: uncommitted changes, commits on no branch (detached HEAD), ignored files that can't simply be rebuilt (like `.env`; `node_modules`, `dist` and other build output are left out), submodules, locks, and selected rows the filter hides.
 - Normal worktrees are removed with `git worktree remove`. If one has uncommitted changes, `--force` is used only after you confirm, and only if the change count is still the same when deletion starts.
 - Locked worktrees (Claude Code locks worktrees while an agent runs) get a warning. They are unlocked and then removed, so git still checks for uncommitted changes. If removal fails, the lock is put back.
 - `dir missing`: the folder is already gone, so only git's entry for it is removed. If it is also locked (git's way of keeping worktrees on removable drives), it is left alone: run `git worktree unlock` first.
-- `orphaned`: the repo is gone, so git can't remove it and the folder is deleted directly. Its contents can't be checked for uncommitted work. A worktree only counts as orphaned if the folder that held the repo still exists. When that is missing too (an unmounted drive, a devcontainer path), it isn't listed. Your home folder, the scanned folders and anything containing them are never deleted this way, and each orphan is checked again just before it is deleted.
+- `orphaned`: the repo is gone, so git can't remove it and the folder is deleted directly. Its contents can't be checked for uncommitted work. A worktree only counts as orphaned if the folder that held the repo still exists. When that is missing too (an unmounted drive, a devcontainer path), it isn't listed. A stray `.git` file pointing inside its own folder doesn't count either. Your home folder, the scanned folders, anything containing them and folders directly in your home folder (like `~/Downloads`) are never deleted this way. Neither is an orphan that holds another repo or worktree. Each orphan is checked again just before it is deleted, through the same folder handle that deletes it, so swapping in a symlink can't redirect the delete.
 - Branches are kept unless you turn on branch deletion with `b`.
 
 ## Scripting
@@ -73,5 +73,8 @@ worktreekill runs git in every worktree it finds, and git reads each repo's own 
 - `core.fsmonitor`, which `git status` runs every time.
 - Filters (`filter.<name>.clean` and friends) defined in the repo's own config, including files it includes. Filters from your global or system config, like git-lfs, keep working. A repo that sets up a filter only in its own config may show files as changed when they aren't.
 - Signature checks in `git log` (`log.showSignature` with `gpg.program`).
+- Hooks (`core.hooksPath` and `.git/hooks`), which `git branch -d` would run.
+- Network access (`protocol.allow=never`), so a "partial clone" repo can't fetch missing objects through its own `core.sshCommand` or remote helper.
+- `GIT_DIR`, `GIT_WORK_TREE` and similar variables, if worktreekill is started from inside a git hook.
 
-Submodules have their own config, which isn't checked. This needs git 2.26 or newer; with older git, status fails and those worktrees can't be deleted from the tool.
+Submodules have their own config, so `git status` skips them: changes inside a submodule aren't counted, and the delete prompt says when a worktree has submodules. This needs git 2.26 or newer; with older git, status fails and those worktrees can't be deleted from the tool.
