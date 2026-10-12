@@ -80,6 +80,8 @@ func key(s string) tea.KeyPressMsg {
 		return tea.KeyPressMsg{Code: tea.KeySpace, Text: " "}
 	case "down":
 		return tea.KeyPressMsg{Code: tea.KeyDown}
+	case "esc":
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	}
 
 	return tea.KeyPressMsg{Code: rune(s[0]), Text: s}
@@ -264,5 +266,80 @@ func TestPromptWarnsAboutIgnoredFiles(t *testing.T) {
 	drive(m, key("enter"))
 	if view := screen(m); !strings.Contains(view, "1 with ignored files (will be lost: .env, secrets/, …)") {
 		t.Fatalf("no warning:\n%s", view)
+	}
+}
+
+func TestSpinnerStopsAfterScan(t *testing.T) {
+	m := New(context.Background(), Options{Title: "t", Visited: func() int64 { return 0 }})
+	if _, cmd := m.Update(tickMsg{}); cmd == nil {
+		t.Fatal("spinner stopped while scanning")
+	}
+
+	m.Update(ScanDoneMsg{})
+	if _, cmd := m.Update(tickMsg{}); cmd != nil {
+		t.Fatal("spinner still ticking after the scan")
+	}
+}
+
+func TestRepoSortOrdersByRepoThenPath(t *testing.T) {
+	m := newModel(t)
+	for _, w := range []wt.Worktree{
+		{Path: "/b/2", RepoName: "app2"},
+		{Path: "/z", RepoName: "app"},
+		{Path: "/a", RepoName: "app"},
+	} {
+		m.Update(FoundMsg{Worktree: w})
+	}
+
+	var got []string
+	for _, r := range m.visible() {
+		got = append(got, r.RepoName+":"+r.Path)
+	}
+
+	if want := "app:/a app:/z app2:/b/2"; strings.Join(got, " ") != want {
+		t.Errorf("order %v, want %s", got, want)
+	}
+}
+
+func TestColumnsFitWideCharacters(t *testing.T) {
+	for _, s := range []string{"feature/日本語のブランチ名", "fix-🔥-hot-path", "👨‍👩‍👧 family", "plain-ascii-branch-name", "短"} {
+		for width := 1; width <= 12; width++ {
+			for name, cut := range map[string]func(string, int) string{"truncEnd": truncEnd, "truncStart": truncStart} {
+				cell := padEnd(cut(s, width), width)
+				if got := ansi.StringWidth(cell); got != width {
+					t.Errorf("%s(%q, %d) padded is %d cells: %q", name, s, width, got, cell)
+				}
+			}
+		}
+	}
+}
+
+func TestSelectAllKeepsSelectionsHiddenByFilter(t *testing.T) {
+	clean, dirty := fixture(t)
+	m := newModel(t, clean, dirty)
+
+	drive(m, key("space")) // select the clean row
+	drive(m, key("/"))
+	for _, r := range "dirty" {
+		drive(m, key(string(r)))
+	}
+
+	drive(m, key("enter"))
+	drive(m, key("a")) // select the shown dirty row
+	drive(m, key("a")) // and clear it again
+	if !m.selected[clean.Path] || m.selected[dirty.Path] {
+		t.Fatalf("selected %v", m.selected)
+	}
+}
+
+func TestEscClearsFilterWhileTyping(t *testing.T) {
+	clean, dirty := fixture(t)
+	m := newModel(t, clean, dirty)
+
+	drive(m, key("/"))
+	drive(m, key("x"))
+	drive(m, key("esc"))
+	if m.filtering || m.filter != "" || len(m.visible()) != 2 {
+		t.Fatalf("filtering %v, filter %q, %d rows", m.filtering, m.filter, len(m.visible()))
 	}
 }

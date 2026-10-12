@@ -235,7 +235,7 @@ func (m *Model) footer() string {
 	}
 
 	if m.filtering {
-		return "\n" + yellow.Render("/"+Sanitize(m.filter)+"█") + dim.Render("  enter apply · esc done")
+		return "\n" + yellow.Render("/"+Sanitize(m.filter)+"█") + dim.Render("  enter apply · esc clear")
 	}
 
 	notice := ""
@@ -254,87 +254,12 @@ func (m *Model) footer() string {
 }
 
 func (m *Model) confirmPrompt() string {
-	visible := map[*row]bool{}
-	for _, r := range m.visible() {
-		visible[r] = true
-	}
-
 	var bytes int64
-	var dirty, locked, lostCommits, unpushed, orphaned, submodules, withIgnored, hidden int
-	var ignored []string
 	for _, r := range m.confirming {
 		bytes += r.bytes()
-		if r.git.Changes > 0 {
-			dirty++
-		}
-
-		switch {
-		case r.git.Unpushed > 0 && r.Branch == "":
-			lostCommits++
-		case r.git.Unpushed > 0:
-			unpushed++
-		}
-
-		if r.Locked {
-			locked++
-		}
-
-		if r.State == wt.StateOrphaned {
-			orphaned++
-		}
-
-		if r.git.Submodules {
-			submodules++
-		}
-
-		if len(r.git.Ignored) > 0 {
-			withIgnored++
-			ignored = append(ignored, r.git.Ignored...)
-		}
-
-		if !visible[r] {
-			hidden++
-		}
 	}
 
-	var warnings []string
-	if dirty > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d with uncommitted changes (will be lost)", dirty))
-	}
-
-	if lostCommits > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d with commits on no branch (will be lost)", lostCommits))
-	}
-
-	if unpushed > 0 && m.deleteBranch {
-		warnings = append(warnings, fmt.Sprintf("%d with unpushed commits (branch kept if unmerged)", unpushed))
-	}
-
-	if locked > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d locked (a tool may be using it)", locked))
-	}
-
-	if orphaned > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d orphaned (folder deleted outright, changes can't be checked)", orphaned))
-	}
-
-	if withIgnored > 0 {
-		names := strings.Join(ignored[:min(2, len(ignored))], ", ")
-		if len(ignored) > 2 {
-			names += ", …"
-		}
-
-		warnings = append(warnings, fmt.Sprintf("%d with ignored files (will be lost: %s)", withIgnored, Sanitize(names)))
-	}
-
-	if submodules > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d with submodules (changes inside them aren't checked)", submodules))
-	}
-
-	if hidden > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d hidden by the filter", hidden))
-	}
-
+	warnings := m.deleteWarnings(m.confirming)
 	target := fmt.Sprintf("%d worktrees", len(m.confirming))
 	if len(m.confirming) == 1 {
 		target = Sanitize(Tildify(m.confirming[0].Path))
@@ -352,4 +277,54 @@ func (m *Model) confirmPrompt() string {
 	}
 
 	return warningLine + "\n" + style.Bold(true).Render(fmt.Sprintf("Delete %s (%s)?", target, FormatBytes(bytes))) + dim.Render(" [y/N]")
+}
+
+// deleteWarnings lists what deleting targets would lose or skip, each with
+// how many targets it applies to, like "2 with uncommitted changes (...)".
+func (m *Model) deleteWarnings(targets []*row) []string {
+	visible := map[*row]bool{}
+	for _, r := range m.visible() {
+		visible[r] = true
+	}
+
+	var ignored []string
+	for _, r := range targets {
+		ignored = append(ignored, r.git.Ignored...)
+	}
+
+	ignoredNames := strings.Join(ignored[:min(2, len(ignored))], ", ")
+	if len(ignored) > 2 {
+		ignoredNames += ", …"
+	}
+
+	checks := []struct {
+		applies func(r *row) bool
+		// text has a %d for the count.
+		text string
+	}{
+		{func(r *row) bool { return r.git.Changes > 0 }, "%d with uncommitted changes (will be lost)"},
+		{func(r *row) bool { return r.git.Unpushed > 0 && r.Branch == "" }, "%d with commits on no branch (will be lost)"},
+		{func(r *row) bool { return m.deleteBranch && r.git.Unpushed > 0 && r.Branch != "" }, "%d with unpushed commits (branch kept if unmerged)"},
+		{func(r *row) bool { return r.Locked }, "%d locked (a tool may be using it)"},
+		{func(r *row) bool { return r.State == wt.StateOrphaned }, "%d orphaned (folder deleted outright, changes can't be checked)"},
+		{func(r *row) bool { return len(r.git.Ignored) > 0 }, "%d with ignored files (will be lost: " + strings.ReplaceAll(Sanitize(ignoredNames), "%", "%%") + ")"},
+		{func(r *row) bool { return r.git.Submodules > 0 }, "%d with submodules or embedded repos (deleted with their changes and unpushed commits, which aren't checked)"},
+		{func(r *row) bool { return !visible[r] }, "%d hidden by the filter"},
+	}
+
+	var warnings []string
+	for _, c := range checks {
+		count := 0
+		for _, r := range targets {
+			if c.applies(r) {
+				count++
+			}
+		}
+
+		if count > 0 {
+			warnings = append(warnings, fmt.Sprintf(c.text, count))
+		}
+	}
+
+	return warnings
 }

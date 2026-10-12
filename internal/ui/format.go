@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/ConstantinChirila/worktree-kill/internal/wt"
 )
 
@@ -135,36 +137,42 @@ func LastUsed(usage *wt.Usage, info *wt.GitInfo) time.Time {
 	return t
 }
 
-// truncEnd cuts the end of s to fit width display cells.
+// The helpers below measure in terminal cells, not runes: CJK characters and
+// most emoji take two cells. They use the same width rules as lipgloss.
+
+// truncEnd cuts the end of s to fit in width cells.
 func truncEnd(s string, width int) string {
-	r := []rune(s)
 	if width <= 0 {
 		return ""
 	}
 
-	if len(r) <= width {
-		return s
-	}
-
-	return string(r[:width-1]) + "…"
+	return ansi.Truncate(s, width, "…")
 }
 
-// truncStart cuts the start of s, keeping the informative tail of a path.
+// truncStart cuts the start of s to fit in width cells, keeping the
+// informative tail of a path.
 func truncStart(s string, width int) string {
-	r := []rune(s)
 	if width <= 0 {
 		return ""
 	}
 
-	if len(r) <= width {
+	over := ansi.StringWidth(s) - width
+	if over <= 0 {
 		return s
 	}
 
-	return "…" + string(r[len(r)-width+1:])
+	// Cut one more cell for the "…". TruncateLeft keeps a wide character the
+	// cut lands in the middle of, so cut further until it fits.
+	out := ansi.TruncateLeft(s, over+1, "…")
+	for n := over + 2; ansi.StringWidth(out) > width; n++ {
+		out = ansi.TruncateLeft(s, n, "…")
+	}
+
+	return out
 }
 
 func padEnd(s string, width int) string {
-	if n := len([]rune(s)); n < width {
+	if n := ansi.StringWidth(s); n < width {
 		return s + strings.Repeat(" ", width-n)
 	}
 
@@ -172,7 +180,7 @@ func padEnd(s string, width int) string {
 }
 
 func padStart(s string, width int) string {
-	if n := len([]rune(s)); n < width {
+	if n := ansi.StringWidth(s); n < width {
 		return strings.Repeat(" ", width-n) + s
 	}
 

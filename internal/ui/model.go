@@ -2,6 +2,7 @@
 package ui
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/ConstantinChirila/worktree-kill/internal/limit"
 	"github.com/ConstantinChirila/worktree-kill/internal/wt"
 )
 
@@ -112,9 +114,8 @@ type Options struct {
 	Title string
 	// Cwd marks the worktree you are in. Empty if unknown.
 	Cwd string
-	// Protected and Home are passed to wt.Remove. See wt.RemoveOptions.
-	Protected []string
-	Home      string
+	// Protect is passed to wt.Remove.
+	Protect wt.Protection
 	// Visited reports how many folders the scan has read.
 	Visited func() int64
 }
@@ -145,11 +146,10 @@ type Model struct {
 	width, height int
 	summary       Summary
 
-	// Limits for background work. Each size walk already reads several
-	// folders at once, so only a couple run together.
-	usageSlots   chan struct{}
-	gitSlots     chan struct{}
-	removalSlots chan struct{}
+	// Limits for background work.
+	usageLimit   limit.Limit
+	gitLimit     limit.Limit
+	removalLimit limit.Limit
 	// One removal per repo at a time: concurrent `git worktree` calls on the
 	// same repo contend for its locks.
 	repoLocksMu sync.Mutex
@@ -167,9 +167,9 @@ func New(ctx context.Context, opts Options) *Model {
 		selected:     map[string]bool{},
 		width:        100,
 		height:       30,
-		usageSlots:   make(chan struct{}, 2),
-		gitSlots:     make(chan struct{}, 8),
-		removalSlots: make(chan struct{}, 4),
+		usageLimit:   limit.New(wt.MeasureConcurrency),
+		gitLimit:     limit.New(wt.InspectConcurrency),
+		removalLimit: limit.New(4),
 		repoLocks:    map[string]*sync.Mutex{},
 	}
 }
@@ -203,6 +203,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 
 	case tickMsg:
+		// The spinner only shows while scanning; stop redrawing after.
+		if !m.scanning {
+			return m, nil
+		}
+
 		m.frame++
 		return m, tick()
 
@@ -256,18 +261,16 @@ func (m *Model) add(w wt.Worktree) tea.Cmd {
 
 	ctx, path := m.ctx, w.Path
 	cmds := []tea.Cmd{func() tea.Msg {
-		m.usageSlots <- struct{}{}
-		defer func() { <-m.usageSlots }()
-		usage, err := wt.MeasureUsage(ctx, path)
-		return usageMsg{path, usage, err}
+		msg := usageMsg{path: path}
+		m.usageLimit.Do(func() { msg.usage, msg.err = wt.MeasureUsage(ctx, path) })
+		return msg
 	}}
 
 	if w.State == wt.StateOK {
 		cmds = append(cmds, func() tea.Msg {
-			m.gitSlots <- struct{}{}
-			defer func() { <-m.gitSlots }()
-			info, err := wt.InspectGit(ctx, w)
-			return gitMsg{path, info, err}
+			msg := gitMsg{path: path}
+			m.gitLimit.Do(func() { msg.info, msg.err = wt.InspectGit(ctx, w) })
+			return msg
 		})
 	} else {
 		r.git = &wt.GitInfo{}
@@ -303,7 +306,7 @@ func (m *Model) visible() []*row {
 
 			return at.Compare(bt)
 		default:
-			return strings.Compare(a.RepoName+a.Path, b.RepoName+b.Path)
+			return cmp.Or(strings.Compare(a.RepoName, b.RepoName), strings.Compare(a.Path, b.Path))
 		}
 	})
 	return out
@@ -354,8 +357,10 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 
 	if m.filtering {
 		switch key {
-		case "enter", "esc":
+		case "enter":
 			m.filtering = false
+		case "esc":
+			m.filtering, m.filter = false, ""
 		case "backspace":
 			if r := []rune(m.filter); len(r) > 0 {
 				m.filter = string(r[:len(r)-1])
@@ -422,6 +427,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.notice = rows[idx].whyNotDeletable()
 		}
 	case "a":
+		// Toggle the shown rows only; selections the filter hides stay.
 		all := true
 		for _, r := range rows {
 			if r.deletable() && !m.selected[r.Path] {
@@ -429,12 +435,12 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			}
 		}
 
-		clear(m.selected)
-		if !all {
-			for _, r := range rows {
-				if r.deletable() {
-					m.selected[r.Path] = true
-				}
+		for _, r := range rows {
+			switch {
+			case all:
+				delete(m.selected, r.Path)
+			case r.deletable():
+				m.selected[r.Path] = true
 			}
 		}
 	case "enter", "d", "delete", "backspace":
@@ -473,40 +479,50 @@ func (m *Model) busy() bool {
 }
 
 func (m *Model) remove(targets []*row) tea.Cmd {
-	opts := wt.RemoveOptions{DeleteBranch: m.deleteBranch, Protected: m.opts.Protected, Home: m.opts.Home}
-	ctx := context.WithoutCancel(m.ctx)
 	cmds := make([]tea.Cmd, 0, len(targets))
 	for _, r := range targets {
 		delete(m.selected, r.Path)
 		r.phase, r.note = phaseQueued, ""
-		w, rowOpts, confirmed := r.Worktree, opts, *r.git
-		// Discarding changes was confirmed with the change count on screen.
-		rowOpts.Force = confirmed.Changes > 0
+		// Read model state here, on the update loop, not in the command.
+		w, confirmed, deleteBranch := r.Worktree, *r.git, m.deleteBranch
 		cmds = append(cmds, func() tea.Msg {
-			m.removalSlots <- struct{}{}
-			defer func() { <-m.removalSlots }()
-			lock := m.repoLock(w.CommonDir)
-			lock.Lock()
-			defer lock.Unlock()
-			if rowOpts.Force {
-				// The prompt may have been up for a while; don't discard
-				// changes that weren't there when it was confirmed.
-				fresh, err := wt.InspectGit(ctx, w)
-				if err == nil && !fresh.SameChanges(confirmed) {
-					err = errors.New("its changes changed since you confirmed; not deleted")
-				}
-
-				if err != nil {
-					return removedMsg{w.Path, wt.RemoveResult{}, err}
-				}
-			}
-
-			result, err := wt.Remove(ctx, w, rowOpts)
-			return removedMsg{w.Path, result, err}
+			var msg removedMsg
+			m.removalLimit.Do(func() { msg = m.removeOne(w, confirmed, deleteBranch) })
+			return msg
 		})
 	}
 
 	return tea.Batch(cmds...)
+}
+
+// removeOne deletes one worktree whose git status was confirmed on screen.
+// It runs in the background, after the prompt, so it only touches the model's
+// fixed settings and its locks.
+func (m *Model) removeOne(w wt.Worktree, confirmed wt.GitInfo, deleteBranch bool) removedMsg {
+	lock := m.repoLock(w.CommonDir)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Deletion was confirmed, so finish it even if the program is quitting.
+	ctx := context.WithoutCancel(m.ctx)
+	opts := wt.RemoveOptions{DeleteBranch: deleteBranch, Protect: m.opts.Protect}
+	// Discarding changes and submodules was confirmed with them on screen.
+	opts.Force = confirmed.NeedsForce()
+	if opts.Force {
+		// The prompt may have been up for a while; don't discard changes that
+		// weren't there when it was confirmed.
+		fresh, err := wt.InspectGit(ctx, w)
+		if err == nil && !fresh.SameChanges(confirmed) {
+			err = errors.New("its changes changed since you confirmed; not deleted")
+		}
+
+		if err != nil {
+			return removedMsg{w.Path, wt.RemoveResult{}, err}
+		}
+	}
+
+	result, err := wt.Remove(ctx, w, opts)
+	return removedMsg{w.Path, result, err}
 }
 
 func (m *Model) finishRemoval(msg removedMsg) {

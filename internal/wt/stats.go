@@ -29,6 +29,10 @@ func (u *Usage) add(info os.FileInfo) {
 	}
 }
 
+// MeasureConcurrency is how many MeasureUsage calls are worth running at once.
+// Each already reads several folders in parallel.
+const MeasureConcurrency = 2
+
 // MeasureUsage walks a worktree without following symlinks, reading several
 // directories at once. Unreadable directories and files are skipped.
 func MeasureUsage(ctx context.Context, root string) (Usage, error) {
@@ -46,7 +50,7 @@ func MeasureUsage(ctx context.Context, root string) (Usage, error) {
 
 	walk(ctx, []string{root}, func(dir string, push func(string)) {
 		entries, err := os.ReadDir(dir)
-		if err != nil {
+		if err != nil || (dir != root && holdsWorktree(dir, entries)) {
 			return
 		}
 
@@ -73,4 +77,19 @@ func MeasureUsage(ctx context.Context, root string) (Usage, error) {
 	})
 
 	return total, ctx.Err()
+}
+
+// holdsWorktree reports whether dir is a linked worktree (or an orphaned
+// one). Those are listed with their own size, so a worktree nested inside
+// another isn't counted twice. Nested plain repos and submodules aren't
+// listed, so they still count.
+func holdsWorktree(dir string, entries []os.DirEntry) bool {
+	for _, entry := range entries {
+		if entry.Name() == ".git" && !entry.IsDir() {
+			_, err := fromDotGitFile(dir)
+			return err == nil
+		}
+	}
+
+	return false
 }

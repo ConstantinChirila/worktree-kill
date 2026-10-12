@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/ConstantinChirila/worktree-kill/internal/limit"
 	"github.com/ConstantinChirila/worktree-kill/internal/ui"
 	"github.com/ConstantinChirila/worktree-kill/internal/wt"
 )
@@ -29,13 +30,15 @@ type record struct {
 	LastUsed  time.Time `json:"lastUsed,omitzero"`
 	Changes   int       `json:"uncommittedChanges"`
 	Unpushed  int       `json:"unpushedCommits"`
+	// GitError is set when git status failed, so the counts above are unknown.
+	GitError string `json:"gitError,omitempty"`
 	// status is the STATUS column text.
 	status string
 }
 
 // report scans, measures every worktree and prints them, largest first.
 func report(ctx context.Context, opts wt.ScanOptions, asJSON bool) error {
-	l := limits{usage: make(chan struct{}, 2), git: make(chan struct{}, 8)}
+	l := limits{usage: limit.New(wt.MeasureConcurrency), git: limit.New(wt.InspectConcurrency)}
 	var mu sync.Mutex
 	var records []record
 	var wg sync.WaitGroup
@@ -73,26 +76,18 @@ func report(ctx context.Context, opts wt.ScanOptions, asJSON bool) error {
 	return tw.Flush()
 }
 
-// limits caps concurrent size walks (each already reads several folders at
-// once) and git inspections.
-type limits struct{ usage, git chan struct{} }
-
-func withSlot(slots chan struct{}, f func()) {
-	slots <- struct{}{}
-	defer func() { <-slots }()
-	f()
-}
+// limits caps concurrent size walks and git inspections.
+type limits struct{ usage, git limit.Limit }
 
 // measure gets a worktree's size and git status, in parallel.
 func measure(ctx context.Context, w wt.Worktree, l limits) record {
 	r := record{Path: w.Path, Repo: w.RepoPath, RepoName: w.RepoName, Branch: w.Branch, Tool: w.Tool, State: w.State.String(), Locked: w.Locked}
 	var usage *wt.Usage
 	var info *wt.GitInfo
-	gitErr := ""
 	var wg sync.WaitGroup
 	if w.State != wt.StateMissing {
 		wg.Go(func() {
-			withSlot(l.usage, func() {
+			l.usage.Do(func() {
 				if u, err := wt.MeasureUsage(ctx, w.Path); err == nil {
 					usage = &u
 				}
@@ -101,11 +96,11 @@ func measure(ctx context.Context, w wt.Worktree, l limits) record {
 	}
 
 	wg.Go(func() {
-		withSlot(l.git, func() {
+		l.git.Do(func() {
 			if i, err := wt.InspectGit(ctx, w); err == nil {
 				info = &i
 			} else {
-				gitErr = "git error: " + err.Error()
+				r.GitError = err.Error()
 			}
 		})
 	})
@@ -122,8 +117,8 @@ func measure(ctx context.Context, w wt.Worktree, l limits) record {
 	r.LastUsed = ui.LastUsed(usage, info)
 	parts := ui.StatusParts(w, info)
 	switch {
-	case gitErr != "":
-		r.status = gitErr
+	case r.GitError != "":
+		r.status = "git error: " + r.GitError
 	case len(parts) == 0:
 		r.status = "clean"
 	default:
