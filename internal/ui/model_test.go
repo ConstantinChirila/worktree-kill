@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -341,5 +342,85 @@ func TestEscClearsFilterWhileTyping(t *testing.T) {
 	drive(m, key("esc"))
 	if m.filtering || m.filter != "" || len(m.visible()) != 2 {
 		t.Fatalf("filtering %v, filter %q, %d rows", m.filtering, m.filter, len(m.visible()))
+	}
+}
+
+func TestDetailsShowFullPathAndHiddenFacts(t *testing.T) {
+	m := New(context.Background(), Options{Title: "~", Visited: func() int64 { return 0 }})
+	drive(m, tea.WindowSizeMsg{Width: 100, Height: 16})
+	long := "/Users/someone/Development/a-rather-long-project-name/.claude/worktrees/feature-with-a-long-descriptive-name"
+	w := wt.Worktree{Path: long, RepoName: "a-rather-long-project-name", RepoPath: "/Users/someone/Development/a-rather-long-project-name",
+		Branch: "feature-with-a-long-descriptive-name", Locked: true, LockReason: "agent running", Tool: "Claude"}
+	m.Update(FoundMsg{Worktree: w})
+	m.Update(usageMsg{path: w.Path})
+	m.Update(gitMsg{path: w.Path, info: wt.GitInfo{Ignored: []string{".env"}}})
+	drive(m, ScanDoneMsg{})
+
+	view := screen(m)
+	t.Log("\n" + view)
+	// The path is wrapped over two lines; rejoin them to check it's all there.
+	joined := strings.ReplaceAll(strings.ReplaceAll(view, "\n  ", ""), "\n", "")
+	for _, want := range []string{long, "locked: agent running", "ignored: .env", "branch feature-with-a-long-descriptive-name"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("details missing %q", want)
+		}
+	}
+
+	if lines := strings.Count(view, "\n") + 1; lines > 16 {
+		t.Errorf("view is %d lines, taller than the 16-line terminal", lines)
+	}
+}
+
+func TestDetailsHideOnShortTerminals(t *testing.T) {
+	clean, _ := fixture(t)
+	m := newModel(t, clean)
+	drive(m, tea.WindowSizeMsg{Width: 100, Height: 8})
+	if strings.Contains(screen(m), "branch clean-branch") {
+		t.Errorf("details shown on an 8-line terminal:\n%s", screen(m))
+	}
+
+	drive(m, tea.WindowSizeMsg{Width: 100, Height: 20})
+	if !strings.Contains(screen(m), "branch clean-branch") {
+		t.Errorf("details missing on a 20-line terminal:\n%s", screen(m))
+	}
+}
+
+func TestViewFitsTheTerminal(t *testing.T) {
+	clean, dirty := fixture(t)
+	m := newModel(t, clean, dirty)
+	for _, w := range []wt.Worktree{
+		{Path: "/a/long/path/" + strings.Repeat("x", 120), RepoName: "app", Branch: "a", Locked: true},
+		{Path: "/b", RepoName: "app", Head: "abc1234", State: wt.StateOrphaned},
+		{Path: "/c", RepoName: "app", Branch: "c"},
+		{Path: "/d", RepoName: "app", Branch: "d"},
+	} {
+		m.Update(FoundMsg{Worktree: w})
+		m.Update(usageMsg{path: w.Path})
+		m.Update(gitMsg{path: w.Path, info: wt.GitInfo{Changes: 1, Unpushed: 1, Submodules: 1, Ignored: []string{".env"}}})
+	}
+
+	check := func(what string) {
+		t.Helper()
+		if lines := strings.Count(screen(m), "\n") + 1; lines > m.height {
+			t.Errorf("%s: %d lines on a %d-line terminal:\n%s", what, lines, m.height, screen(m))
+		}
+	}
+
+	for _, size := range [][2]int{{100, 12}, {100, 10}, {60, 12}, {160, 40}} {
+		drive(m, tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		check(fmt.Sprintf("%dx%d list", size[0], size[1]))
+		drive(m, key("a"))
+		drive(m, key("b"))
+		drive(m, key("enter"))
+		check(fmt.Sprintf("%dx%d prompt", size[0], size[1]))
+		drive(m, key("n"))
+		drive(m, key("b"))
+		drive(m, key("a"))
+	}
+
+	// At the size in the screenshot, the details show.
+	drive(m, tea.WindowSizeMsg{Width: 100, Height: 12})
+	if m.detailsHeight() == 0 {
+		t.Error("details hidden on a 12-line terminal")
 	}
 }

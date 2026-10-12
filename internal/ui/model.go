@@ -339,7 +339,34 @@ func (m *Model) cursorIndex(rows []*row) int {
 	return 0
 }
 
-func (m *Model) listHeight() int { return max(3, m.height-6) }
+// listHeight is how many rows fit: the screen minus the title and column
+// header lines, the details block and the footer.
+func (m *Model) listHeight() int {
+	// While confirming, the warnings matter more than the rows.
+	minRows := 3
+	if m.confirming != nil {
+		minRows = 1
+	}
+
+	return max(minRows, m.height-2-m.detailsHeight()-m.footerHeight())
+}
+
+// detailsLines is the height of the details block under the list: the full
+// path (up to two lines) and one line of facts the table leaves out. It has a
+// fixed height so the list doesn't shift as the cursor moves.
+const detailsLines = 3
+
+// detailsHeight is 0 when showing the details would leave fewer than three
+// rows, where the rows matter more.
+func (m *Model) detailsHeight() int {
+	if m.height-2-m.footerHeight()-detailsLines < 3 {
+		return 0
+	}
+
+	return detailsLines
+}
+
+func (m *Model) footerHeight() int { return strings.Count(m.footer(), "\n") + 1 }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	key := msg.String()

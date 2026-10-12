@@ -3,11 +3,13 @@ package ui
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/ConstantinChirila/worktree-kill/internal/wt"
 )
@@ -73,6 +75,10 @@ func (m *Model) View() tea.View {
 	}
 
 	b.WriteString(strings.Repeat("\n", max(0, height-(end-offset))))
+	for _, line := range m.details(rows) {
+		b.WriteString(line + "\n")
+	}
+
 	b.WriteString(m.footer())
 
 	v := tea.NewView(b.String())
@@ -189,6 +195,75 @@ func (m *Model) renderRow(r *row, l layout, isCursor bool) string {
 	return b.String()
 }
 
+// details returns detailsHeight lines describing the highlighted row in full:
+// its path, wrapped, then what the table cuts off or doesn't show.
+func (m *Model) details(rows []*row) []string {
+	lines := make([]string, m.detailsHeight())
+	if len(lines) == 0 || len(rows) == 0 {
+		return lines
+	}
+
+	r := rows[m.cursorIndex(rows)]
+	width := max(20, m.width-2)
+	// A path longer than two lines keeps its end, the informative part.
+	path := truncStart(Sanitize(Tildify(r.Path)), 2*width)
+	wrapped := strings.Split(ansi.Hardwrap(path, width, true), "\n")
+	n := min(2, len(wrapped))
+	for i := range n {
+		lines[i] = "  " + wrapped[i]
+	}
+
+	// Facts go right under the path; a short path leaves the last line blank.
+	lines[n] = "  " + dim.Render(truncEnd(Sanitize(strings.Join(r.facts(), " · ")), width))
+	return lines
+}
+
+// facts lists what the details line shows about a row: anything the table
+// cuts off or leaves out, most important first (the line is cut to fit), then
+// where it comes from.
+func (r *row) facts() []string {
+	var facts []string
+	if r.Locked && r.LockReason != "" {
+		facts = append(facts, "locked: "+r.LockReason)
+	}
+
+	if r.phase == phaseFailed {
+		facts = append(facts, "failed: "+r.note)
+	}
+
+	if r.gitErr != nil {
+		facts = append(facts, "git error: "+r.gitErr.Error())
+	}
+
+	if r.git != nil && len(r.git.Ignored) > 0 {
+		facts = append(facts, "ignored: "+strings.Join(r.git.Ignored, ", "))
+	}
+
+	if r.git != nil && r.git.Submodules > 0 {
+		facts = append(facts, fmt.Sprintf("%d populated submodules", r.git.Submodules))
+	}
+
+	if why := r.whyNotDeletable(); r.active() && why != "" && r.gitErr == nil {
+		facts = append(facts, why)
+	}
+
+	switch {
+	case r.Branch != "":
+		facts = append(facts, "branch "+r.Branch)
+	case r.Head != "":
+		facts = append(facts, "detached at "+r.Head[:min(7, len(r.Head))])
+	}
+
+	switch {
+	case r.RepoPath != "":
+		facts = append(facts, "repo "+Tildify(r.RepoPath))
+	case r.State == wt.StateOrphaned:
+		facts = append(facts, "repo "+r.RepoName+" (gone)")
+	}
+
+	return facts
+}
+
 func (r *row) status(cwd string) (string, lipgloss.Style) {
 	switch r.phase {
 	case phaseQueued:
@@ -234,13 +309,16 @@ func (m *Model) footer() string {
 		return m.confirmPrompt()
 	}
 
+	// Every footer line is cut to the screen width, so it never wraps and
+	// listHeight can count its lines.
+	width := max(20, m.width)
 	if m.filtering {
-		return "\n" + yellow.Render("/"+Sanitize(m.filter)+"█") + dim.Render("  enter apply · esc clear")
+		return "\n" + truncEnd(yellow.Render("/"+Sanitize(m.filter)+"█")+dim.Render("  enter apply · esc clear"), width)
 	}
 
 	notice := ""
 	if m.notice != "" {
-		notice = yellow.Render(Sanitize(m.notice))
+		notice = yellow.Render(truncEnd(Sanitize(m.notice), width))
 	}
 
 	branch := "off"
@@ -250,7 +328,7 @@ func (m *Model) footer() string {
 
 	help := fmt.Sprintf("↑↓ move · space select · a all · enter delete · b delete branch: %s · s sort: %s · / filter · q quit",
 		branch, sortLabels[m.sort])
-	return notice + "\n" + dim.Render(help)
+	return notice + "\n" + dim.Render(truncEnd(help, width))
 }
 
 func (m *Model) confirmPrompt() string {
@@ -265,18 +343,27 @@ func (m *Model) confirmPrompt() string {
 		target = Sanitize(Tildify(m.confirming[0].Path))
 	}
 
+	branches := ""
 	if m.deleteBranch {
-		target += " and branches"
+		branches = " and branches"
 	}
 
+	// Warnings wrap (each one matters); the question stays on one line, with
+	// a long path cut at the start.
+	width := max(20, m.width)
+	question := func(target string) string {
+		return fmt.Sprintf("Delete %s%s (%s)?", target, branches, FormatBytes(bytes))
+	}
+
+	target = truncStart(target, max(10, width-ansi.StringWidth(question("")+" [y/N]")))
 	warningLine := ""
 	style := yellow
 	if len(warnings) > 0 {
-		warningLine = red.Render("⚠ " + strings.Join(warnings, " · "))
+		warningLine = red.Render(ansi.Wordwrap("⚠ "+strings.Join(warnings, " · "), width, ""))
 		style = red
 	}
 
-	return warningLine + "\n" + style.Bold(true).Render(fmt.Sprintf("Delete %s (%s)?", target, FormatBytes(bytes))) + dim.Render(" [y/N]")
+	return warningLine + "\n" + style.Bold(true).Render(question(target)) + dim.Render(" [y/N]")
 }
 
 // deleteWarnings lists what deleting targets would lose or skip, each with
@@ -287,9 +374,14 @@ func (m *Model) deleteWarnings(targets []*row) []string {
 		visible[r] = true
 	}
 
+	// Name each ignored file once, even if several targets have it.
 	var ignored []string
 	for _, r := range targets {
-		ignored = append(ignored, r.git.Ignored...)
+		for _, name := range r.git.Ignored {
+			if !slices.Contains(ignored, name) {
+				ignored = append(ignored, name)
+			}
+		}
 	}
 
 	ignoredNames := strings.Join(ignored[:min(2, len(ignored))], ", ")

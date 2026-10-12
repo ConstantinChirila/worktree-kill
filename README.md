@@ -71,6 +71,8 @@ worktreekill finds all of them in one pass and puts the biggest, oldest ones at 
 
 Results appear as they're found. Size and status fill in as they're calculated.
 
+Under the list, the highlighted row is shown in full: its whole path, plus what the table cuts off or leaves out (lock reason, git errors, ignored files, branch, repo). They hide only when the terminal is too short to also show three rows.
+
 ## Where it looks
 
 With no arguments it scans your home folder. It skips hidden folders, `node_modules`, `bower_components`, `Pods`, `DerivedData`, Go's module cache (`~/go/pkg`), and `~/Library`, `~/Applications`, `~/Movies`, `~/Music`, `~/Pictures`, `~/OrbStack`, `~/miniconda3`, `~/anaconda3`, `~/miniforge3`. It also scans the places tools keep worktrees:
