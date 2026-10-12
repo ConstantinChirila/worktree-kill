@@ -12,7 +12,7 @@ import (
 // script writes an executable shell script that creates marker when run.
 func script(t *testing.T, path, marker string) {
 	t.Helper()
-	write(t, path, "#!/bin/sh\ntouch "+marker+"\nexit 1\n")
+	write(t, path, "#!/bin/sh\ntouch "+filepath.ToSlash(marker)+"\nexit 1\n")
 	if err := os.Chmod(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestSubmoduleFilterIsNotRun(t *testing.T) {
 	run(t, app, "commit", "-qm", "add sub")
 
 	marker := filepath.Join(root, "filter-ran")
-	run(t, filepath.Join(app, "sub"), "config", "filter.evil.clean", "touch "+marker+"; cat")
+	run(t, filepath.Join(app, "sub"), "config", "filter.evil.clean", "touch "+filepath.ToSlash(marker)+"; cat")
 	later := time.Now().Add(time.Minute)
 	if err := os.Chtimes(filepath.Join(app, "sub", "README"), later, later); err != nil {
 		t.Fatal(err)

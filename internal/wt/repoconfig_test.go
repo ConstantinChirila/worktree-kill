@@ -24,7 +24,7 @@ func trappedWorktree(t *testing.T, driver string) (w Worktree, marker string) {
 
 	path := filepath.Join(root, "wt")
 	run(t, repo, "worktree", "add", "-q", "-b", "wt", path)
-	run(t, repo, "config", "filter."+driver+".clean", "touch "+marker+"; cat")
+	run(t, repo, "config", "filter."+driver+".clean", "touch "+filepath.ToSlash(marker)+"; cat")
 	run(t, repo, "config", "filter."+driver+".required", "true")
 
 	later := time.Now().Add(time.Minute)
@@ -64,7 +64,7 @@ func TestGlobalFilterStillRuns(t *testing.T) {
 	root := tempRoot(t)
 	marker := filepath.Join(root, "global-ran")
 	global := filepath.Join(root, "gitconfig")
-	write(t, global, "[filter \"mine\"]\n\tclean = touch "+marker+"; cat\n")
+	write(t, global, "[filter \"mine\"]\n\tclean = touch "+filepath.ToSlash(marker)+"; cat\n")
 	t.Setenv("GIT_CONFIG_GLOBAL", global)
 
 	repo := newRepo(t, root, "app")
@@ -124,7 +124,7 @@ func TestRepoGpgProgramIsNotRun(t *testing.T) {
 
 	marker := filepath.Join(root, "gpg-ran")
 	gpg := filepath.Join(root, "gpg.sh")
-	write(t, gpg, "#!/bin/sh\ntouch "+marker+"\nexit 1\n")
+	write(t, gpg, "#!/bin/sh\ntouch "+filepath.ToSlash(marker)+"\nexit 1\n")
 	if err := os.Chmod(gpg, 0o755); err != nil {
 		t.Fatal(err)
 	}

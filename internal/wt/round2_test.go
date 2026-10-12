@@ -43,7 +43,7 @@ func TestPathsCompareIgnoringCaseWhereTheFileSystemDoes(t *testing.T) {
 		t.Skip("case-sensitive platform")
 	}
 
-	if !within("/Users/Me/dev/x", "/users/me") || !samePath(`/Users/Me`, `/users/me`) {
+	if !within(filepath.FromSlash("/Users/Me/dev/x"), filepath.FromSlash("/users/me")) || !samePath("Me", "me") {
 		t.Error("case-insensitive comparison failed")
 	}
 }
@@ -67,7 +67,8 @@ func TestOrphanSwappedForSymlinkIsNotDeleted(t *testing.T) {
 	}
 
 	if err := os.Symlink(target, dir); err != nil {
-		t.Fatal(err)
+		// Windows needs Developer Mode or admin rights for symlinks.
+		t.Skip("can't create symlinks here:", err)
 	}
 
 	if err := removeOrphan(w, RemoveOptions{}); err == nil {
@@ -116,7 +117,7 @@ func TestSkipDirLeavesOutCachesButNotGoSrc(t *testing.T) {
 	}
 
 	for c, want := range cases {
-		if got := skipDir(c[0], c[1], home); got != want {
+		if got := skipDir(filepath.FromSlash(c[0]), c[1], filepath.FromSlash(home)); got != want {
 			t.Errorf("skipDir(%q, %q) = %v, want %v", c[0], c[1], got, want)
 		}
 	}

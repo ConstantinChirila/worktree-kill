@@ -124,8 +124,9 @@ func TestRemoveMissingDropsOnlyThatEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	list := run(t, repo, "worktree", "list")
-	if strings.Contains(list, filepath.Join(root, "one")) || !strings.Contains(list, filepath.Join(root, "two")) {
+	// git prints forward slashes on Windows too.
+	list := filepath.ToSlash(run(t, repo, "worktree", "list"))
+	if strings.Contains(list, filepath.ToSlash(filepath.Join(root, "one"))) || !strings.Contains(list, filepath.ToSlash(filepath.Join(root, "two"))) {
 		t.Fatalf("wrong entries pruned:\n%s", list)
 	}
 
@@ -198,7 +199,7 @@ func TestRepoFsmonitorIsNotRun(t *testing.T) {
 	repo := newRepo(t, root, "app")
 	marker := filepath.Join(root, "ran")
 	hook := filepath.Join(root, "hook.sh")
-	write(t, hook, "#!/bin/sh\ntouch "+marker+"\nexit 1\n")
+	write(t, hook, "#!/bin/sh\ntouch "+filepath.ToSlash(marker)+"\nexit 1\n")
 	if err := os.Chmod(hook, 0o755); err != nil {
 		t.Fatal(err)
 	}

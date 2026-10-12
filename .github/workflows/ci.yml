@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Windows runners convert line endings by default; tests compare file
+      # contents exactly as written.
+      - name: Keep line endings as written
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Versions
+        run: |
+          go version
+          git --version
+
+      - name: Vet
+        run: go vet ./...
+
+      # The race detector needs cgo, which Windows runners don't set up.
+      - name: Test with race detector
+        if: runner.os != 'Windows'
+        run: go test -race ./...
+
+      - name: Test
+        if: runner.os == 'Windows'
+        run: go test ./...
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+  npm:
+    name: npm packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build packages
+        run: node scripts/build-npm.mjs 0.0.0-ci
+
+      # Install from the packed tarballs (what npm would publish), laid out
+      # the way npm installs them, then run the launcher.
+      - name: Launcher runs the packed binary
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          npm pack --silent --pack-destination "$work" ./dist/npm/worktreekill ./dist/npm/linux-x64
+          mkdir -p "$work/node_modules/worktreekill" "$work/node_modules/@worktreekill/linux-x64"
+          tar -xzf "$work"/worktreekill-0.0.0-ci.tgz -C "$work/node_modules/worktreekill" --strip-components 1
+          tar -xzf "$work"/worktreekill-linux-x64-0.0.0-ci.tgz -C "$work/node_modules/@worktreekill/linux-x64" --strip-components 1
+          got=$(node "$work/node_modules/worktreekill/bin/worktreekill.js" --version)
+          test "$got" = "0.0.0-ci" || { echo "launcher printed '$got'"; exit 1; }
+          node "$work/node_modules/worktreekill/bin/worktreekill.js" --list "$work" > /dev/null

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -234,6 +235,10 @@ func TestRemove(t *testing.T) {
 }
 
 func TestMeasureUsageLeavesOutHardLinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("link counts aren't read on Windows; sizes include hard-linked files")
+	}
+
 	root := tempRoot(t)
 	big := make([]byte, 64*1024)
 	write(t, filepath.Join(root, "a"), string(big))
@@ -263,7 +268,7 @@ func TestMeasureUsageLeavesOutHardLinks(t *testing.T) {
 }
 
 func TestToolFor(t *testing.T) {
-	t.Setenv("CODEX_HOME", "/opt/codex")
+	t.Setenv("CODEX_HOME", filepath.FromSlash("/opt/codex"))
 	cases := map[string]string{
 		"/u/.claude/worktrees/x":            "Claude",
 		"/u/proj/.claude/worktrees/x":       "Claude",
@@ -280,7 +285,7 @@ func TestToolFor(t *testing.T) {
 	}
 
 	for path, want := range cases {
-		if got := ToolFor(path, "/u"); got != want {
+		if got := ToolFor(filepath.FromSlash(path), filepath.FromSlash("/u")); got != want {
 			t.Errorf("ToolFor(%q) = %q, want %q", path, got, want)
 		}
 	}

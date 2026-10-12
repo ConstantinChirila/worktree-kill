@@ -13,7 +13,7 @@ AI coding tools create a lot of worktrees, and each one is a full checkout, ofte
 | Column    | Meaning |
 |-----------|---------|
 | TOOL      | Which tool made it, guessed from its location: Claude, Cursor, Codex, Conductor, T3, or plain git |
-| SIZE      | Roughly the space deleting it frees. Hard-linked files (pnpm links packages from its store) are left out, since deleting them frees nothing |
+| SIZE      | Roughly the space deleting it frees. Hard-linked files (pnpm links packages from its store) are left out, since deleting them frees nothing. On Windows they are counted |
 | LAST USED | Newest of the last commit and the last file change |
 | STATUS    | `clean`, `N changed` (uncommitted), `N unpushed` (commits on no remote branch and not on `main`/`master`), `locked`, `dir missing`, `orphaned`, `you are here` |
 
