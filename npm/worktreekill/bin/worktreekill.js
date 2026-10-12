@@ -1,22 +1,19 @@
 #!/usr/bin/env node
-// Launches the prebuilt Go binary from the platform package npm installed
-// alongside this one (via optionalDependencies, filtered by os/cpu).
+// Launches the prebuilt Go binary for this platform, shipped in vendor/.
 "use strict";
 
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
-const { exeName, packageName } = require("../lib/platform.js");
+const path = require("node:path");
+const { exeName, platformDir } = require("../lib/platform.js");
 
-const pkg = packageName(process.platform, process.arch);
-
-let binary;
-try {
-	binary = require.resolve(`${pkg}/bin/${exeName(process.platform)}`);
-} catch {
+const vendor = path.join(__dirname, "..", "vendor");
+const binary = path.join(vendor, platformDir(process.platform, process.arch), exeName(process.platform));
+if (!fs.existsSync(binary)) {
+	const available = fs.existsSync(vendor) ? fs.readdirSync(vendor).join(", ") : "none";
 	console.error(
-		`worktreekill: no prebuilt binary for ${process.platform}-${process.arch}.\n` +
-			`Expected the optional dependency "${pkg}". If you installed with --no-optional ` +
-			`or --omit=optional, reinstall without it.`,
+		`worktreekill: no prebuilt binary for ${process.platform}-${process.arch} (available: ${available}).\n` +
+			"Please open an issue: https://github.com/ConstantinChirila/worktree-kill/issues",
 	);
 	process.exit(1);
 }

@@ -71,16 +71,16 @@ jobs:
       - name: Build packages
         run: node scripts/build-npm.mjs 0.0.0-ci
 
-      # Install from the packed tarballs (what npm would publish), laid out
-      # the way npm installs them, then run the launcher.
+      # Install from the packed tarball (what npm would publish), laid out
+      # the way npm installs it, then run the launcher.
       - name: Launcher runs the packed binary
         run: |
           set -eu
           work=$(mktemp -d)
-          npm pack --silent --pack-destination "$work" ./dist/npm/worktreekill ./dist/npm/linux-x64
-          mkdir -p "$work/node_modules/worktreekill" "$work/node_modules/@worktreekill/linux-x64"
+          npm pack --silent --pack-destination "$work" ./dist/npm/worktreekill
+          mkdir -p "$work/node_modules/worktreekill"
           tar -xzf "$work"/worktreekill-0.0.0-ci.tgz -C "$work/node_modules/worktreekill" --strip-components 1
-          tar -xzf "$work"/worktreekill-linux-x64-0.0.0-ci.tgz -C "$work/node_modules/@worktreekill/linux-x64" --strip-components 1
+          ls "$work/node_modules/worktreekill/vendor"
           got=$(node "$work/node_modules/worktreekill/bin/worktreekill.js" --version)
           test "$got" = "0.0.0-ci" || { echo "launcher printed '$got'"; exit 1; }
           node "$work/node_modules/worktreekill/bin/worktreekill.js" --list "$work" > /dev/null

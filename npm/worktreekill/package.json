@@ -14,6 +14,7 @@
   "files": [
     "bin",
     "lib",
+    "vendor",
     "README.md"
   ],
   "keywords": [
@@ -30,6 +31,5 @@
   "license": "MIT",
   "engines": {
     "node": ">=18"
-  },
-  "optionalDependencies": {}
+  }
 }
