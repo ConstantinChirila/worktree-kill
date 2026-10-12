@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -24,15 +23,18 @@ func skipDir(parent, name, home string) bool {
 		return true
 	}
 
-	// macOS home folders that are large and never hold repos.
+	// Home folders that are large and never hold repos: macOS media and app
+	// folders, VM disks, and Python distributions.
 	if parent == home {
 		switch name {
-		case "Library", "Applications", "Movies", "Music", "Pictures":
+		case "Library", "Applications", "Movies", "Music", "Pictures",
+			"OrbStack", "miniconda3", "anaconda3", "miniforge3":
 			return true
 		}
 	}
 
-	return false
+	// Go's module cache (~/go/pkg); ~/go/src can still hold repos.
+	return name == "pkg" && home != "" && parent == filepath.Join(home, "go")
 }
 
 // ScanOptions configures a Scanner. Paths should be canonical (see CanonicalPath).
@@ -52,35 +54,28 @@ func (o ScanOptions) Protected() []string {
 	return protected
 }
 
-// Scanner walks folders looking for worktrees, reading many folders at once.
+// Scanner walks folders looking for worktrees, reading several at once.
 type Scanner struct {
 	opts      ScanOptions
 	protected []string
 	found     func(Worktree)
-	workers   int
 	visited   atomic.Int64
 
-	mu      sync.Mutex
-	seen    map[string]bool
-	repos   map[string]bool
-	stack   []string
-	pending int
-	cond    *sync.Cond
+	mu    sync.Mutex
+	seen  map[string]bool
+	repos map[string]bool
 }
 
 // NewScanner returns a Scanner that calls found (from multiple goroutines)
 // once for each distinct worktree.
 func NewScanner(opts ScanOptions, found func(Worktree)) *Scanner {
-	s := &Scanner{
+	return &Scanner{
 		opts:      opts,
 		protected: opts.Protected(),
 		found:     found,
-		workers:   runtime.NumCPU() * 4,
 		seen:      map[string]bool{},
 		repos:     map[string]bool{},
 	}
-	s.cond = sync.NewCond(&s.mu)
-	return s
 }
 
 // Visited is the number of directories read so far. Safe to call concurrently.
@@ -88,74 +83,15 @@ func (s *Scanner) Visited() int64 { return s.visited.Load() }
 
 // Run walks the roots. It returns when the walk finishes or ctx is cancelled.
 func (s *Scanner) Run(ctx context.Context) {
-	// The stack is LIFO, so push in reverse to read the first root first.
-	for i := len(s.opts.Roots) - 1; i >= 0; i-- {
-		s.push(filepath.Clean(s.opts.Roots[i]))
+	roots := make([]string, len(s.opts.Roots))
+	for i, root := range s.opts.Roots {
+		roots[i] = filepath.Clean(root)
 	}
 
-	var wg sync.WaitGroup
-	for range s.workers {
-		wg.Go(func() {
-			for {
-				dir, ok := s.pop(ctx)
-				if !ok {
-					return
-				}
-
-				s.visit(dir)
-				s.done()
-			}
-		})
-	}
-
-	stop := context.AfterFunc(ctx, func() {
-		s.mu.Lock()
-		s.cond.Broadcast()
-		s.mu.Unlock()
-	})
-	defer stop()
-	wg.Wait()
+	walk(ctx, roots, s.visit)
 }
 
-func (s *Scanner) push(dir string) {
-	s.mu.Lock()
-	s.stack = append(s.stack, dir)
-	s.pending++
-	s.mu.Unlock()
-	s.cond.Signal()
-}
-
-func (s *Scanner) pop(ctx context.Context) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for len(s.stack) == 0 {
-		if s.pending == 0 || ctx.Err() != nil {
-			return "", false
-		}
-
-		s.cond.Wait()
-	}
-
-	if ctx.Err() != nil {
-		return "", false
-	}
-
-	dir := s.stack[len(s.stack)-1]
-	s.stack = s.stack[:len(s.stack)-1]
-	return dir, true
-}
-
-func (s *Scanner) done() {
-	s.mu.Lock()
-	s.pending--
-	finished := s.pending == 0
-	s.mu.Unlock()
-	if finished {
-		s.cond.Broadcast()
-	}
-}
-
-func (s *Scanner) visit(dir string) {
+func (s *Scanner) visit(dir string, push func(string)) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -179,9 +115,9 @@ func (s *Scanner) visit(dir string) {
 		// Repos and worktrees are leaves: worktrees nested inside them are
 		// registered in the repo's metadata. Tool folders are still walked,
 		// to find orphans there that git no longer knows about.
-		for _, sub := range repoToolDirs() {
+		for _, sub := range repoToolDirs {
 			if info, err := os.Lstat(filepath.Join(dir, sub)); err == nil && info.IsDir() {
-				s.push(filepath.Join(dir, sub))
+				push(filepath.Join(dir, sub))
 			}
 		}
 
@@ -191,7 +127,7 @@ func (s *Scanner) visit(dir string) {
 	for _, entry := range entries {
 		// DirEntry.IsDir is false for symlinks, so links are never followed.
 		if entry.IsDir() && !skipDir(dir, entry.Name(), s.opts.Home) {
-			s.push(filepath.Join(dir, entry.Name()))
+			push(filepath.Join(dir, entry.Name()))
 		}
 	}
 }

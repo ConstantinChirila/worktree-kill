@@ -131,7 +131,7 @@ func runUI(ctx context.Context, opts wt.ScanOptions, title string) int {
 
 	var program *tea.Program
 	scanner := wt.NewScanner(opts, func(w wt.Worktree) { program.Send(ui.FoundMsg{Worktree: w}) })
-	model := ui.New(ctx, ui.Options{Title: title, Cwd: cwd, Protected: opts.Protected(), Visited: scanner.Visited})
+	model := ui.New(ctx, ui.Options{Title: title, Cwd: cwd, Protected: opts.Protected(), Home: opts.Home, Visited: scanner.Visited})
 	// Ctrl+C is handled by the model so in-flight deletions can finish.
 	program = tea.NewProgram(model, tea.WithContext(ctx), tea.WithoutSignalHandler())
 

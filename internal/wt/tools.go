@@ -57,8 +57,8 @@ func KnownDirs(home string) []string {
 	return dirs
 }
 
-// repoToolDirs returns the in-repo worktree folders, in OS path form.
-func repoToolDirs() []string {
+// repoToolDirs are the in-repo worktree folders, in OS path form.
+var repoToolDirs = func() []string {
 	var dirs []string
 	for _, t := range tools {
 		for _, d := range t.repoDirs {
@@ -67,7 +67,7 @@ func repoToolDirs() []string {
 	}
 
 	return dirs
-}
+}()
 
 // ToolFor guesses which tool created the worktree at path from where it lives,
 // returning "git" when no tool matches.

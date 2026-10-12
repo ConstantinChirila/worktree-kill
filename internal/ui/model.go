@@ -112,8 +112,9 @@ type Options struct {
 	Title string
 	// Cwd marks the worktree you are in. Empty if unknown.
 	Cwd string
-	// Protected paths are passed to wt.Remove. See wt.ScanOptions.Protected.
+	// Protected and Home are passed to wt.Remove. See wt.RemoveOptions.
 	Protected []string
+	Home      string
 	// Visited reports how many folders the scan has read.
 	Visited func() int64
 }
@@ -144,28 +145,45 @@ type Model struct {
 	width, height int
 	summary       Summary
 
-	// Limits for background work; size walks are IO-heavy so they get fewer slots.
-	usageSlots chan struct{}
-	gitSlots   chan struct{}
-	// One removal at a time: concurrent `git worktree` calls on the same repo
-	// contend for its locks.
-	removalLock sync.Mutex
+	// Limits for background work. Each size walk already reads several
+	// folders at once, so only a couple run together.
+	usageSlots   chan struct{}
+	gitSlots     chan struct{}
+	removalSlots chan struct{}
+	// One removal per repo at a time: concurrent `git worktree` calls on the
+	// same repo contend for its locks.
+	repoLocksMu sync.Mutex
+	repoLocks   map[string]*sync.Mutex
 }
 
 // New returns a Model that fills in as FoundMsg messages arrive.
 func New(ctx context.Context, opts Options) *Model {
 	return &Model{
-		ctx:        ctx,
-		opts:       opts,
-		started:    time.Now(),
-		scanning:   true,
-		byPath:     map[string]*row{},
-		selected:   map[string]bool{},
-		width:      100,
-		height:     30,
-		usageSlots: make(chan struct{}, 4),
-		gitSlots:   make(chan struct{}, 8),
+		ctx:          ctx,
+		opts:         opts,
+		started:      time.Now(),
+		scanning:     true,
+		byPath:       map[string]*row{},
+		selected:     map[string]bool{},
+		width:        100,
+		height:       30,
+		usageSlots:   make(chan struct{}, 2),
+		gitSlots:     make(chan struct{}, 8),
+		removalSlots: make(chan struct{}, 4),
+		repoLocks:    map[string]*sync.Mutex{},
 	}
+}
+
+// repoLock returns the lock serializing removals in one repo. Orphans have no
+// repo and share the "" lock, which is fine.
+func (m *Model) repoLock(commonDir string) *sync.Mutex {
+	m.repoLocksMu.Lock()
+	defer m.repoLocksMu.Unlock()
+	if m.repoLocks[commonDir] == nil {
+		m.repoLocks[commonDir] = &sync.Mutex{}
+	}
+
+	return m.repoLocks[commonDir]
 }
 
 // Summary reports what was deleted. Call it after the program exits.
@@ -455,23 +473,26 @@ func (m *Model) busy() bool {
 }
 
 func (m *Model) remove(targets []*row) tea.Cmd {
-	opts := wt.RemoveOptions{DeleteBranch: m.deleteBranch, Protected: m.opts.Protected}
+	opts := wt.RemoveOptions{DeleteBranch: m.deleteBranch, Protected: m.opts.Protected, Home: m.opts.Home}
 	ctx := context.WithoutCancel(m.ctx)
 	cmds := make([]tea.Cmd, 0, len(targets))
 	for _, r := range targets {
 		delete(m.selected, r.Path)
 		r.phase, r.note = phaseQueued, ""
-		w, rowOpts, confirmed := r.Worktree, opts, r.git.Changes
+		w, rowOpts, confirmed := r.Worktree, opts, *r.git
 		// Discarding changes was confirmed with the change count on screen.
-		rowOpts.Force = confirmed > 0
+		rowOpts.Force = confirmed.Changes > 0
 		cmds = append(cmds, func() tea.Msg {
-			m.removalLock.Lock()
-			defer m.removalLock.Unlock()
+			m.removalSlots <- struct{}{}
+			defer func() { <-m.removalSlots }()
+			lock := m.repoLock(w.CommonDir)
+			lock.Lock()
+			defer lock.Unlock()
 			if rowOpts.Force {
 				// The prompt may have been up for a while; don't discard
-				// changes that weren't on screen when it was confirmed.
+				// changes that weren't there when it was confirmed.
 				fresh, err := wt.InspectGit(ctx, w)
-				if err == nil && fresh.Changes != confirmed {
+				if err == nil && !fresh.SameChanges(confirmed) {
 					err = errors.New("its changes changed since you confirmed; not deleted")
 				}
 

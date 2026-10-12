@@ -35,24 +35,19 @@ type record struct {
 
 // report scans, measures every worktree and prints them, largest first.
 func report(ctx context.Context, opts wt.ScanOptions, asJSON bool) error {
+	l := limits{usage: make(chan struct{}, 2), git: make(chan struct{}, 8)}
 	var mu sync.Mutex
-	var worktrees []wt.Worktree
-	wt.NewScanner(opts, func(w wt.Worktree) {
-		mu.Lock()
-		worktrees = append(worktrees, w)
-		mu.Unlock()
-	}).Run(ctx)
-
-	records := make([]record, len(worktrees))
+	var records []record
 	var wg sync.WaitGroup
-	slots := make(chan struct{}, 8)
-	for i, w := range worktrees {
+	// Measure each worktree as soon as it is found, while the scan goes on.
+	wt.NewScanner(opts, func(w wt.Worktree) {
 		wg.Go(func() {
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			records[i] = measure(ctx, w)
+			r := measure(ctx, w, l)
+			mu.Lock()
+			records = append(records, r)
+			mu.Unlock()
 		})
-	}
+	}).Run(ctx)
 
 	wg.Wait()
 	slices.SortFunc(records, func(a, b record) int { return cmp.Compare(b.SizeBytes, a.SizeBytes) })
@@ -78,23 +73,50 @@ func report(ctx context.Context, opts wt.ScanOptions, asJSON bool) error {
 	return tw.Flush()
 }
 
-func measure(ctx context.Context, w wt.Worktree) record {
+// limits caps concurrent size walks (each already reads several folders at
+// once) and git inspections.
+type limits struct{ usage, git chan struct{} }
+
+func withSlot(slots chan struct{}, f func()) {
+	slots <- struct{}{}
+	defer func() { <-slots }()
+	f()
+}
+
+// measure gets a worktree's size and git status, in parallel.
+func measure(ctx context.Context, w wt.Worktree, l limits) record {
 	r := record{Path: w.Path, Repo: w.RepoPath, RepoName: w.RepoName, Branch: w.Branch, Tool: w.Tool, State: w.State.String(), Locked: w.Locked}
 	var usage *wt.Usage
-	if w.State != wt.StateMissing {
-		if u, err := wt.MeasureUsage(ctx, w.Path); err == nil {
-			usage = &u
-			r.SizeBytes = u.Bytes
-		}
-	}
-
 	var info *wt.GitInfo
 	gitErr := ""
-	if i, err := wt.InspectGit(ctx, w); err == nil {
-		info = &i
-		r.Changes, r.Unpushed = i.Changes, i.Unpushed
-	} else {
-		gitErr = "git error: " + err.Error()
+	var wg sync.WaitGroup
+	if w.State != wt.StateMissing {
+		wg.Go(func() {
+			withSlot(l.usage, func() {
+				if u, err := wt.MeasureUsage(ctx, w.Path); err == nil {
+					usage = &u
+				}
+			})
+		})
+	}
+
+	wg.Go(func() {
+		withSlot(l.git, func() {
+			if i, err := wt.InspectGit(ctx, w); err == nil {
+				info = &i
+			} else {
+				gitErr = "git error: " + err.Error()
+			}
+		})
+	})
+
+	wg.Wait()
+	if usage != nil {
+		r.SizeBytes = usage.Bytes
+	}
+
+	if info != nil {
+		r.Changes, r.Unpushed = info.Changes, info.Unpushed
 	}
 
 	r.LastUsed = ui.LastUsed(usage, info)

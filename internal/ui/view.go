@@ -260,7 +260,8 @@ func (m *Model) confirmPrompt() string {
 	}
 
 	var bytes int64
-	var dirty, locked, lostCommits, unpushed, orphaned, hidden int
+	var dirty, locked, lostCommits, unpushed, orphaned, submodules, withIgnored, hidden int
+	var ignored []string
 	for _, r := range m.confirming {
 		bytes += r.bytes()
 		if r.git.Changes > 0 {
@@ -280,6 +281,15 @@ func (m *Model) confirmPrompt() string {
 
 		if r.State == wt.StateOrphaned {
 			orphaned++
+		}
+
+		if r.git.Submodules {
+			submodules++
+		}
+
+		if len(r.git.Ignored) > 0 {
+			withIgnored++
+			ignored = append(ignored, r.git.Ignored...)
 		}
 
 		if !visible[r] {
@@ -306,6 +316,19 @@ func (m *Model) confirmPrompt() string {
 
 	if orphaned > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d orphaned (folder deleted outright, changes can't be checked)", orphaned))
+	}
+
+	if withIgnored > 0 {
+		names := strings.Join(ignored[:min(2, len(ignored))], ", ")
+		if len(ignored) > 2 {
+			names += ", …"
+		}
+
+		warnings = append(warnings, fmt.Sprintf("%d with ignored files (will be lost: %s)", withIgnored, Sanitize(names)))
+	}
+
+	if submodules > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d with submodules (changes inside them aren't checked)", submodules))
 	}
 
 	if hidden > 0 {

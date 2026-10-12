@@ -2,8 +2,9 @@ package wt
 
 import (
 	"context"
-	"io/fs"
+	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -17,40 +18,59 @@ type Usage struct {
 	LatestChange time.Time
 }
 
-// MeasureUsage walks a worktree without following symlinks.
+func (u *Usage) add(info os.FileInfo) {
+	if info.ModTime().After(u.LatestChange) {
+		u.LatestChange = info.ModTime()
+	}
+
+	// Directories always have several links (one per subdirectory).
+	if bytes, linked := diskUsage(info); !linked || info.IsDir() {
+		u.Bytes += bytes
+	}
+}
+
+// MeasureUsage walks a worktree without following symlinks, reading several
+// directories at once. Unreadable directories and files are skipped.
 func MeasureUsage(ctx context.Context, root string) (Usage, error) {
-	var usage Usage
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	info, err := os.Lstat(root)
+	if err != nil {
+		return Usage{}, err
+	}
+
+	var mu sync.Mutex
+	var total Usage
+	total.add(info)
+	if !info.IsDir() {
+		return total, nil
+	}
+
+	walk(ctx, []string{root}, func(dir string, push func(string)) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
 		}
 
-		if err != nil {
-			// Unreadable subtrees are skipped rather than failing the whole walk.
-			if entry != nil && entry.IsDir() {
-				return fs.SkipDir
+		// Sum locally and merge once per directory, not once per file.
+		var usage Usage
+		for _, entry := range entries {
+			info, err := entry.Info()
+			if err != nil {
+				continue
 			}
 
-			return nil
+			usage.add(info)
+			if entry.IsDir() {
+				push(filepath.Join(dir, entry.Name()))
+			}
 		}
 
-		info, err := entry.Info()
-		if err != nil {
-			return nil
+		mu.Lock()
+		total.Bytes += usage.Bytes
+		if usage.LatestChange.After(total.LatestChange) {
+			total.LatestChange = usage.LatestChange
 		}
-
-		if info.ModTime().After(usage.LatestChange) {
-			usage.LatestChange = info.ModTime()
-		}
-
-		// Directories always have several links (one per subdirectory).
-		bytes, linked := diskUsage(info)
-		if !linked || entry.IsDir() {
-			usage.Bytes += bytes
-		}
-
-		return nil
+		mu.Unlock()
 	})
 
-	return usage, err
+	return total, ctx.Err()
 }

@@ -253,3 +253,16 @@ func TestSanitize(t *testing.T) {
 		t.Errorf("Sanitize = %q", got)
 	}
 }
+
+func TestPromptWarnsAboutIgnoredFiles(t *testing.T) {
+	m := newModel(t)
+	w := wt.Worktree{Path: "/tmp/with-env", RepoName: "app", Branch: "x"}
+	m.Update(FoundMsg{Worktree: w})
+	m.Update(usageMsg{path: w.Path})
+	m.Update(gitMsg{path: w.Path, info: wt.GitInfo{Ignored: []string{".env", "secrets/", "key.pem"}}})
+
+	drive(m, key("enter"))
+	if view := screen(m); !strings.Contains(view, "1 with ignored files (will be lost: .env, secrets/, …)") {
+		t.Fatalf("no warning:\n%s", view)
+	}
+}

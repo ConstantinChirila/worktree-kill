@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -68,19 +69,13 @@ func fromDotGitFile(dir string) (Worktree, error) {
 		return Worktree{}, err
 	}
 
-	target, ok := strings.CutPrefix(strings.TrimSpace(string(content)), "gitdir:")
+	gitDir, ok := parseDotGitFile(content, dir)
 	if !ok {
 		return Worktree{}, errNotLinkedWorktree
 	}
 
-	gitDir := strings.TrimSpace(target)
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(dir, gitDir)
-	}
-
-	gitDir = filepath.Clean(gitDir)
 	if _, err := os.Stat(gitDir); errors.Is(err, os.ErrNotExist) {
-		if !repoDeleted(gitDir) {
+		if !repoDeleted(dir, gitDir) {
 			return Worktree{}, errNotLinkedWorktree
 		}
 
@@ -95,21 +90,43 @@ func fromDotGitFile(dir string) (Worktree, error) {
 	return fromGitDir(dir, gitDir)
 }
 
-// repoDeleted reports whether a missing gitDir belonged to a repository that
-// was deleted, as opposed to one that is only out of reach. Orphans are
-// deleted outright, so this errs towards "no":
+// parseDotGitFile returns the admin dir named by the `.git` file of the
+// worktree in dir ("gitdir: <path>", relative paths are relative to dir).
+func parseDotGitFile(content []byte, dir string) (string, bool) {
+	target, ok := strings.CutPrefix(strings.TrimSpace(string(content)), "gitdir:")
+	if !ok {
+		return "", false
+	}
+
+	gitDir := strings.TrimSpace(target)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(dir, gitDir)
+	}
+
+	return filepath.Clean(gitDir), true
+}
+
+// repoDeleted reports whether the missing gitDir of the worktree in dir
+// belonged to a repository that was deleted, as opposed to one that is only
+// out of reach. Orphans are deleted outright, so this errs towards "no":
 //   - gitDir must look like a worktree admin dir (<repo>/.git/worktrees/<name>);
+//   - the repo must have lived outside dir (a stray .git file pointing inside
+//     its own folder is not a worktree);
 //   - the repo's .git dir must be gone (if it exists, only git's entry for
 //     this worktree was removed and `git worktree repair` can relink it);
 //   - the folder the repo lived in must still exist. If that is gone too, the
 //     repo is more likely on an unmounted drive or inside a container.
-func repoDeleted(gitDir string) bool {
+func repoDeleted(dir, gitDir string) bool {
 	adminRoot := filepath.Dir(gitDir)
 	if filepath.Base(adminRoot) != "worktrees" {
 		return false
 	}
 
 	commonDir := filepath.Dir(adminRoot)
+	if within(repoPathFromCommonDir(commonDir), dir) {
+		return false
+	}
+
 	if _, err := os.Lstat(commonDir); !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
@@ -198,12 +215,37 @@ func worktreesOfRepo(commonDir string) []Worktree {
 			dotGit = filepath.Join(gitDir, dotGit)
 		}
 
-		if w, err := fromGitDir(filepath.Dir(filepath.Clean(dotGit)), gitDir); err == nil {
+		path := filepath.Dir(filepath.Clean(dotGit))
+		if !pointsBack(path, gitDir) {
+			continue
+		}
+
+		if w, err := fromGitDir(path, gitDir); err == nil {
 			result = append(result, w)
 		}
 	}
 
 	return result
+}
+
+// pointsBack reports whether the worktree folder at path is really the one
+// registered at gitDir: its `.git` file must name gitDir. Otherwise the entry
+// is forged or stale (git would refuse to remove it), and listing it could
+// hide the real worktree at that path. A missing folder can't be checked and
+// is reported as missing.
+func pointsBack(path, gitDir string) bool {
+	content, err := os.ReadFile(filepath.Join(path, ".git"))
+	if errors.Is(err, os.ErrNotExist) {
+		_, statErr := os.Lstat(path)
+		return errors.Is(statErr, os.ErrNotExist)
+	}
+
+	if err != nil {
+		return false
+	}
+
+	named, ok := parseDotGitFile(content, path)
+	return ok && samePath(CanonicalPath(named), CanonicalPath(gitDir))
 }
 
 func repoPathFromCommonDir(commonDir string) string {
@@ -228,8 +270,23 @@ func CanonicalPath(path string) string {
 	return filepath.Clean(path)
 }
 
+// caseInsensitive is set where the default file system ignores case, so
+// "C:\Users" and "c:\users" (or "/Users" and "/users" on macOS) are the same
+// folder. On a case-sensitive volume this only makes the checks that use it
+// stricter.
+var caseInsensitive = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+
+// samePath reports whether two clean paths name the same folder.
+func samePath(a, b string) bool {
+	if caseInsensitive {
+		return strings.EqualFold(a, b)
+	}
+
+	return a == b
+}
+
 // within reports whether path is dir or inside it. Both must be clean.
 func within(path, dir string) bool {
-	sep := string(filepath.Separator)
-	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, sep)+sep)
+	prefix := strings.TrimSuffix(dir, string(filepath.Separator)) + string(filepath.Separator)
+	return samePath(path, dir) || (len(path) >= len(prefix) && samePath(path[:len(prefix)], prefix))
 }
