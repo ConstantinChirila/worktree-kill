@@ -3,22 +3,23 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 
 	"github.com/ConstantinChirila/worktree-kill/internal/wt"
 )
 
 // Messages sent into the program from the scanner and background work.
 type (
-	FoundMsg    struct{ Worktree wt.Worktree }
+	// FoundMsg adds a worktree to the list.
+	FoundMsg struct{ Worktree wt.Worktree }
+	// ScanDoneMsg reports that the scan has finished.
 	ScanDoneMsg struct{}
 	usageMsg    struct {
 		path  string
@@ -42,8 +43,8 @@ type phase int
 
 const (
 	phaseIdle phase = iota
+	// phaseQueued: waiting for, or running, its turn to be removed.
 	phaseQueued
-	phaseDeleting
 	phaseDeleted
 	phaseFailed
 )
@@ -57,20 +58,28 @@ type row struct {
 	note   string
 }
 
+// active reports whether the row can still be acted on.
 func (r *row) active() bool { return r.phase == phaseIdle || r.phase == phaseFailed }
 
-func (r *row) lastUsed() time.Time {
-	var t time.Time
-	if r.usage != nil {
-		t = r.usage.LatestChange
+// whyNotDeletable explains why an active row can't be deleted, or returns "".
+// Deletion waits for git status so the prompt can warn about everything that
+// would be lost.
+func (r *row) whyNotDeletable() string {
+	switch {
+	case r.git == nil:
+		return "still checking git status"
+	case r.gitErr != nil:
+		return "git status failed, so its changes can't be checked"
+	case r.State == wt.StateMissing && r.Locked:
+		return "locked and its folder is missing, maybe on an unmounted drive: run git worktree unlock first"
 	}
 
-	if r.git != nil && r.git.LastCommit.After(t) {
-		t = r.git.LastCommit
-	}
-
-	return t
+	return ""
 }
+
+func (r *row) deletable() bool { return r.active() && r.whyNotDeletable() == "" }
+
+func (r *row) lastUsed() time.Time { return LastUsed(r.usage, r.git) }
 
 func (r *row) bytes() int64 {
 	if r.usage == nil {
@@ -97,11 +106,23 @@ type Summary struct {
 	Failures []string
 }
 
+// Options configures a Model.
+type Options struct {
+	// Title names what is being scanned, like "~".
+	Title string
+	// Cwd marks the worktree you are in. Empty if unknown.
+	Cwd string
+	// Protected paths are passed to wt.Remove. See wt.ScanOptions.Protected.
+	Protected []string
+	// Visited reports how many folders the scan has read.
+	Visited func() int64
+}
+
+// Model is the Bubble Tea model for the worktree list.
 type Model struct {
+	// ctx is kept because Bubble Tea commands have no other way to get one.
 	ctx      context.Context
-	title    string
-	cwd      string
-	visited  func() int64
+	opts     Options
 	started  time.Time
 	scanTook time.Duration
 	scanning bool
@@ -116,43 +137,48 @@ type Model struct {
 	filtering    bool
 	deleteBranch bool
 	confirming   []*row
+	notice       string
 	quitting     bool
 	frame        int
 
 	width, height int
 	summary       Summary
+
+	// Limits for background work; size walks are IO-heavy so they get fewer slots.
+	usageSlots chan struct{}
+	gitSlots   chan struct{}
+	// One removal at a time: concurrent `git worktree` calls on the same repo
+	// contend for its locks.
+	removalLock sync.Mutex
 }
 
-// Limits for background work; size walks are IO-heavy so they get fewer slots.
-var (
-	usageSlots  = make(chan struct{}, 4)
-	gitSlots    = make(chan struct{}, 8)
-	removalLock sync.Mutex
-)
-
-func New(ctx context.Context, title, cwd string, visited func() int64) *Model {
+// New returns a Model that fills in as FoundMsg messages arrive.
+func New(ctx context.Context, opts Options) *Model {
 	return &Model{
-		ctx:      ctx,
-		title:    title,
-		cwd:      cwd,
-		visited:  visited,
-		started:  time.Now(),
-		scanning: true,
-		byPath:   map[string]*row{},
-		selected: map[string]bool{},
-		width:    100,
-		height:   30,
+		ctx:        ctx,
+		opts:       opts,
+		started:    time.Now(),
+		scanning:   true,
+		byPath:     map[string]*row{},
+		selected:   map[string]bool{},
+		width:      100,
+		height:     30,
+		usageSlots: make(chan struct{}, 4),
+		gitSlots:   make(chan struct{}, 8),
 	}
 }
 
+// Summary reports what was deleted. Call it after the program exits.
 func (m *Model) Summary() Summary { return m.summary }
 
+// Init starts the spinner.
 func (m *Model) Init() tea.Cmd { return tick() }
 
 func tick() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
+// Update handles a message.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -204,7 +230,7 @@ func (m *Model) add(w wt.Worktree) tea.Cmd {
 		m.cursor = w.Path
 	}
 
-	if w.State != wt.StateOK && w.State != wt.StateOrphaned {
+	if w.State == wt.StateMissing {
 		r.usage = &wt.Usage{}
 		r.git = &wt.GitInfo{}
 		return nil
@@ -212,16 +238,16 @@ func (m *Model) add(w wt.Worktree) tea.Cmd {
 
 	ctx, path := m.ctx, w.Path
 	cmds := []tea.Cmd{func() tea.Msg {
-		usageSlots <- struct{}{}
-		defer func() { <-usageSlots }()
+		m.usageSlots <- struct{}{}
+		defer func() { <-m.usageSlots }()
 		usage, err := wt.MeasureUsage(ctx, path)
 		return usageMsg{path, usage, err}
 	}}
 
 	if w.State == wt.StateOK {
 		cmds = append(cmds, func() tea.Msg {
-			gitSlots <- struct{}{}
-			defer func() { <-gitSlots }()
+			m.gitSlots <- struct{}{}
+			defer func() { <-m.gitSlots }()
 			info, err := wt.InspectGit(ctx, w)
 			return gitMsg{path, info, err}
 		})
@@ -296,6 +322,7 @@ func (m *Model) listHeight() int { return max(3, m.height-6) }
 
 func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	key := msg.String()
+	m.notice = ""
 
 	if m.confirming != nil {
 		targets := m.confirming
@@ -363,18 +390,23 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "/":
 		m.filtering = true
 	case "space":
-		if len(rows) > 0 && rows[idx].active() {
-			p := rows[idx].Path
-			if m.selected[p] {
-				delete(m.selected, p)
-			} else {
-				m.selected[p] = true
-			}
+		if len(rows) == 0 || !rows[idx].active() {
+			break
+		}
+
+		p := rows[idx].Path
+		switch {
+		case m.selected[p]:
+			delete(m.selected, p)
+		case rows[idx].deletable():
+			m.selected[p] = true
+		default:
+			m.notice = rows[idx].whyNotDeletable()
 		}
 	case "a":
 		all := true
 		for _, r := range rows {
-			if r.active() && !m.selected[r.Path] {
+			if r.deletable() && !m.selected[r.Path] {
 				all = false
 			}
 		}
@@ -382,7 +414,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		clear(m.selected)
 		if !all {
 			for _, r := range rows {
-				if r.active() {
+				if r.deletable() {
 					m.selected[r.Path] = true
 				}
 			}
@@ -390,12 +422,17 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "enter", "d", "delete", "backspace":
 		var targets []*row
 		for _, r := range m.rows {
-			if m.selected[r.Path] && r.active() {
+			if m.selected[r.Path] && r.deletable() {
 				targets = append(targets, r)
 			}
 		}
 
 		if len(targets) == 0 && len(rows) > 0 && rows[idx].active() {
+			if reason := rows[idx].whyNotDeletable(); reason != "" {
+				m.notice = reason
+				break
+			}
+
 			targets = []*row{rows[idx]}
 		}
 
@@ -409,7 +446,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 
 func (m *Model) busy() bool {
 	for _, r := range m.rows {
-		if r.phase == phaseQueued || r.phase == phaseDeleting {
+		if r.phase == phaseQueued {
 			return true
 		}
 	}
@@ -418,20 +455,32 @@ func (m *Model) busy() bool {
 }
 
 func (m *Model) remove(targets []*row) tea.Cmd {
-	opts := wt.RemoveOptions{DeleteBranch: m.deleteBranch}
+	opts := wt.RemoveOptions{DeleteBranch: m.deleteBranch, Protected: m.opts.Protected}
+	ctx := context.WithoutCancel(m.ctx)
 	cmds := make([]tea.Cmd, 0, len(targets))
 	for _, r := range targets {
 		delete(m.selected, r.Path)
 		r.phase, r.note = phaseQueued, ""
-		w, o := r.Worktree, opts
+		w, rowOpts, confirmed := r.Worktree, opts, r.git.Changes
 		// Discarding changes was confirmed with the change count on screen.
-		o.Force = r.git != nil && r.git.Changes > 0
+		rowOpts.Force = confirmed > 0
 		cmds = append(cmds, func() tea.Msg {
-			// One removal at a time: concurrent `git worktree` calls on the
-			// same repo contend for its locks.
-			removalLock.Lock()
-			defer removalLock.Unlock()
-			result, err := wt.Remove(context.WithoutCancel(m.ctx), w, o)
+			m.removalLock.Lock()
+			defer m.removalLock.Unlock()
+			if rowOpts.Force {
+				// The prompt may have been up for a while; don't discard
+				// changes that weren't on screen when it was confirmed.
+				fresh, err := wt.InspectGit(ctx, w)
+				if err == nil && fresh.Changes != confirmed {
+					err = errors.New("its changes changed since you confirmed; not deleted")
+				}
+
+				if err != nil {
+					return removedMsg{w.Path, wt.RemoveResult{}, err}
+				}
+			}
+
+			result, err := wt.Remove(ctx, w, rowOpts)
 			return removedMsg{w.Path, result, err}
 		})
 	}
@@ -461,323 +510,4 @@ func (m *Model) finishRemoval(msg removedMsg) {
 
 	m.summary.Removed++
 	m.summary.Freed += r.bytes()
-}
-
-// ---- rendering ----
-
-var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FF5F87"))
-	dim         = lipgloss.NewStyle().Faint(true)
-	headerStyle = lipgloss.NewStyle().Bold(true).Faint(true)
-	goneStyle   = lipgloss.NewStyle().Faint(true)
-	red         = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	green       = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	yellow      = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	blue        = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
-	magenta     = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
-	cyan        = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	spinner     = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-)
-
-type layout struct{ tool, repo, branch, path, size, age, status int }
-
-func (m *Model) layout() layout {
-	l := layout{tool: 9, size: 8, age: 9}
-	// 2 for the selection mark, 7 single-space gaps.
-	flex := max(40, m.width-2-l.tool-l.size-l.age-7)
-	l.repo = min(18, flex*15/100)
-	l.branch = min(30, flex*25/100)
-	l.status = min(28, flex*22/100)
-	l.path = flex - l.repo - l.branch - l.status
-	return l
-}
-
-func (m *Model) View() tea.View {
-	var b strings.Builder
-	rows := m.visible()
-	l := m.layout()
-
-	b.WriteString(m.headerLine(rows) + "\n")
-	b.WriteString(headerStyle.Render(strings.Join([]string{
-		"  " + padEnd("TOOL", l.tool), padEnd("REPO", l.repo), padEnd("BRANCH", l.branch),
-		padEnd("PATH", l.path), padStart("SIZE", l.size), padStart("LAST USED", l.age), "STATUS",
-	}, " ")) + "\n")
-
-	height := m.listHeight()
-	idx := m.cursorIndex(rows)
-	offset := min(max(0, idx-height/2), max(0, len(rows)-height))
-	end := min(len(rows), offset+height)
-	for i := offset; i < end; i++ {
-		b.WriteString(m.renderRow(rows[i], l, i == idx) + "\n")
-	}
-
-	if len(rows) == 0 {
-		msg := "Looking for worktrees…"
-		if !m.scanning {
-			msg = "No worktrees found."
-		}
-
-		if m.filter != "" {
-			msg = "No worktrees match the filter."
-		}
-
-		b.WriteString(dim.Render("  "+msg) + "\n")
-		end = offset + 1
-	}
-
-	b.WriteString(strings.Repeat("\n", max(0, height-(end-offset))))
-	b.WriteString(m.footer())
-
-	v := tea.NewView(b.String())
-	v.AltScreen = true
-	v.WindowTitle = "worktreekill"
-	return v
-}
-
-func (m *Model) headerLine(rows []*row) string {
-	var total int64
-	count := 0
-	for _, r := range m.rows {
-		if r.active() {
-			total += r.bytes()
-			count++
-		}
-	}
-
-	scan := fmt.Sprintf("scanned %s in %.1fs", m.title, m.scanTook.Seconds())
-	if m.scanning {
-		scan = fmt.Sprintf("%s scanning %s · %d dirs", spinner[m.frame%len(spinner)], m.title, m.visited())
-	}
-
-	parts := []string{titleStyle.Render("worktreekill"), dim.Render(scan), fmt.Sprintf("%d worktrees · %s", count, FormatBytes(total))}
-	if n := len(m.selected); n > 0 {
-		var sel int64
-		for p := range m.selected {
-			sel += m.byPath[p].bytes()
-		}
-
-		parts = append(parts, cyan.Render(fmt.Sprintf("%d selected (%s)", n, FormatBytes(sel))))
-	}
-
-	if m.summary.Removed > 0 {
-		parts = append(parts, green.Render("freed "+FormatBytes(m.summary.Freed)))
-	}
-
-	if m.filter != "" || m.filtering {
-		parts = append(parts, yellow.Render(fmt.Sprintf("filter: %s (%d)", m.filter, len(rows))))
-	}
-
-	return strings.Join(parts, "  ")
-}
-
-func (m *Model) renderRow(r *row, l layout, isCursor bool) string {
-	mark := "○ "
-	switch {
-	case m.selected[r.Path]:
-		mark = "◉ "
-	case r.phase == phaseDeleted:
-		mark = "  "
-	}
-
-	branch := r.Branch
-	if branch == "" && r.Head != "" {
-		branch = "(" + r.Head[:min(7, len(r.Head))] + ")"
-	}
-
-	size, sizeStyle := "…", dim
-	if r.usage != nil {
-		size, sizeStyle = FormatBytes(r.usage.Bytes), lipgloss.NewStyle()
-		switch {
-		case r.usage.Bytes > 1<<30:
-			sizeStyle = red
-		case r.usage.Bytes > 100<<20:
-			sizeStyle = yellow
-		}
-	}
-
-	age, ageStyle := "…", dim
-	if last := r.lastUsed(); !last.IsZero() {
-		age = FormatAge(last, time.Now())
-		switch days := time.Since(last).Hours() / 24; {
-		case days > 30:
-			ageStyle = red
-		case days > 7:
-			ageStyle = yellow
-		default:
-			ageStyle = green
-		}
-	} else if r.usage != nil && r.git != nil {
-		age = "-"
-	}
-
-	status, statusStyle := m.status(r)
-	cells := []struct {
-		text  string
-		style lipgloss.Style
-	}{
-		{mark, cyan},
-		{padEnd(truncEnd(r.Tool, l.tool), l.tool) + " ", magenta},
-		{padEnd(truncEnd(r.RepoName, l.repo), l.repo) + " ", lipgloss.NewStyle().Bold(true)},
-		{padEnd(truncEnd(branch, l.branch), l.branch) + " ", blue},
-		{padEnd(truncStart(Tildify(r.Path), l.path), l.path) + " ", lipgloss.NewStyle()},
-		{padStart(size, l.size) + " ", sizeStyle},
-		{padStart(age, l.age) + " ", ageStyle},
-		{truncEnd(status, l.status), statusStyle},
-	}
-
-	var b strings.Builder
-	for _, c := range cells {
-		style := c.style
-		if r.phase == phaseDeleted {
-			style = goneStyle
-		}
-
-		if isCursor {
-			style = style.Reverse(true)
-		}
-
-		b.WriteString(style.Render(c.text))
-	}
-
-	return b.String()
-}
-
-func (m *Model) status(r *row) (string, lipgloss.Style) {
-	switch r.phase {
-	case phaseQueued:
-		return "queued", yellow
-	case phaseDeleting:
-		return "deleting…", yellow
-	case phaseDeleted:
-		if r.note != "" {
-			return "deleted, " + r.note, green
-		}
-
-		return "deleted", green
-	case phaseFailed:
-		return "failed: " + r.note, red
-	}
-
-	var parts []string
-	if r.Path == m.cwd || strings.HasPrefix(m.cwd, r.Path+string(filepath.Separator)) {
-		parts = append(parts, "you are here")
-	}
-
-	switch r.State {
-	case wt.StateMissing:
-		return "dir missing (stale)", dim
-	case wt.StateOrphaned:
-		return "orphaned (repo gone)", yellow
-	}
-
-	if r.Locked {
-		parts = append(parts, "locked")
-	}
-
-	if r.gitErr != nil {
-		return "git error: " + r.gitErr.Error(), red
-	}
-
-	if r.git == nil {
-		if len(parts) > 0 {
-			return strings.Join(parts, " · "), yellow
-		}
-
-		return "…", dim
-	}
-
-	if r.git.Changes > 0 {
-		parts = append(parts, fmt.Sprintf("%d changed", r.git.Changes))
-	}
-
-	if r.git.Unpushed > 0 {
-		parts = append(parts, fmt.Sprintf("%d unpushed", r.git.Unpushed))
-	}
-
-	if len(parts) == 0 {
-		return "clean", green
-	}
-
-	return strings.Join(parts, " · "), yellow
-}
-
-func (m *Model) footer() string {
-	if m.quitting {
-		return yellow.Render("Finishing deletions in progress…") + "\n"
-	}
-
-	if m.confirming != nil {
-		return m.confirmPrompt()
-	}
-
-	if m.filtering {
-		return "\n" + yellow.Render("/"+m.filter+"█") + dim.Render("  enter apply · esc done")
-	}
-
-	branch := "off"
-	if m.deleteBranch {
-		branch = yellow.Render("on")
-	}
-
-	help := fmt.Sprintf("↑↓ move · space select · a all · enter delete · b delete branch: %s · s sort: %s · / filter · q quit",
-		branch, sortLabels[m.sort])
-	return "\n" + dim.Render(help)
-}
-
-func (m *Model) confirmPrompt() string {
-	var bytes int64
-	var dirty, locked, unpushed, orphaned int
-	for _, r := range m.confirming {
-		bytes += r.bytes()
-		if r.git != nil && r.git.Changes > 0 {
-			dirty++
-		}
-
-		if r.git != nil && r.git.Unpushed > 0 {
-			unpushed++
-		}
-
-		if r.Locked {
-			locked++
-		}
-
-		if r.State == wt.StateOrphaned {
-			orphaned++
-		}
-	}
-
-	var warnings []string
-	if dirty > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d with uncommitted changes (will be lost)", dirty))
-	}
-
-	if locked > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d locked (a tool may be using it)", locked))
-	}
-
-	if orphaned > 0 {
-		warnings = append(warnings, fmt.Sprintf("%d orphaned (directory deleted outright)", orphaned))
-	}
-
-	if unpushed > 0 && m.deleteBranch {
-		warnings = append(warnings, fmt.Sprintf("%d with unpushed commits (branch kept if unmerged)", unpushed))
-	}
-
-	what := fmt.Sprintf("%d worktrees", len(m.confirming))
-	if len(m.confirming) == 1 {
-		what = Tildify(m.confirming[0].Path)
-	}
-
-	if m.deleteBranch {
-		what += " and branches"
-	}
-
-	line1 := ""
-	style := yellow
-	if len(warnings) > 0 {
-		line1 = red.Render("⚠ " + strings.Join(warnings, " · "))
-		style = red
-	}
-
-	return line1 + "\n" + style.Bold(true).Render(fmt.Sprintf("Delete %s (%s)?", what, FormatBytes(bytes))) + dim.Render(" [y/N]")
 }

@@ -3,19 +3,14 @@
 package main
 
 import (
-	"cmp"
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strings"
-	"sync"
-	"text/tabwriter"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -23,7 +18,7 @@ import (
 	"github.com/ConstantinChirila/worktree-kill/internal/wt"
 )
 
-// Set at build time with -ldflags "-X main.version=...".
+// version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
 const usage = `worktreekill: find and delete git worktrees, like npkill.
@@ -33,7 +28,8 @@ Usage
 
   With no dir, scans your home folder plus the places AI tools keep
   worktrees (~/.claude-worktrees, ~/.cursor/worktrees, ~/.codex/worktrees,
-  ~/conductor, ~/.t3/worktrees). With dirs, scans only those.
+  $CODEX_HOME/worktrees, ~/conductor, ~/.t3/worktrees). With dirs, scans
+  only those. When output is piped, prints the table instead of the UI.
 
 Options
   -l, --list      print a table and exit (no UI)
@@ -57,7 +53,7 @@ func main() {
 	flags.BoolVar(&showVersion, "version", false, "")
 	flags.BoolVar(&showVersion, "v", false, "")
 	if err := flags.Parse(os.Args[1:]); err != nil {
-		if err == flag.ErrHelp {
+		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
 
@@ -69,7 +65,17 @@ func main() {
 		return
 	}
 
-	home, _ := os.UserHomeDir()
+	// Without a home folder, explicit dirs still work; only "~" and the
+	// home-relative tool folders are lost.
+	home, err := os.UserHomeDir()
+	switch {
+	case err == nil:
+		home = wt.CanonicalPath(home)
+	case flags.NArg() == 0:
+		fmt.Fprintln(os.Stderr, "worktreekill: can't find your home folder; pass the folders to scan:", err)
+		os.Exit(1)
+	}
+
 	roots, title := scanRoots(flags.Args(), home)
 	opts := wt.ScanOptions{Roots: roots, Home: home}
 
@@ -106,6 +112,7 @@ func scanRoots(args []string, home string) (roots []string, title string) {
 			abs = arg
 		}
 
+		abs = wt.CanonicalPath(abs)
 		roots = append(roots, abs)
 		names = append(names, ui.Tildify(abs))
 	}
@@ -114,11 +121,17 @@ func scanRoots(args []string, home string) (roots []string, title string) {
 }
 
 func runUI(ctx context.Context, opts wt.ScanOptions, title string) int {
-	cwd, _ := os.Getwd()
-	var scanner *wt.Scanner
+	// Only used to mark the worktree you are in, so an error just skips that.
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = ""
+	} else {
+		cwd = wt.CanonicalPath(cwd)
+	}
+
 	var program *tea.Program
-	scanner = wt.NewScanner(opts, func(w wt.Worktree) { program.Send(ui.FoundMsg{Worktree: w}) })
-	model := ui.New(ctx, title, cwd, scanner.Visited)
+	scanner := wt.NewScanner(opts, func(w wt.Worktree) { program.Send(ui.FoundMsg{Worktree: w}) })
+	model := ui.New(ctx, ui.Options{Title: title, Cwd: cwd, Protected: opts.Protected(), Visited: scanner.Visited})
 	// Ctrl+C is handled by the model so in-flight deletions can finish.
 	program = tea.NewProgram(model, tea.WithContext(ctx), tea.WithoutSignalHandler())
 
@@ -138,7 +151,7 @@ func runUI(ctx context.Context, opts wt.ScanOptions, title string) int {
 	}
 
 	for _, f := range summary.Failures {
-		fmt.Fprintln(os.Stderr, "Failed:", f)
+		fmt.Fprintln(os.Stderr, "Failed:", ui.Sanitize(f))
 	}
 
 	if len(summary.Failures) > 0 {
@@ -146,103 +159,4 @@ func runUI(ctx context.Context, opts wt.ScanOptions, title string) int {
 	}
 
 	return 0
-}
-
-type entry struct {
-	Path      string    `json:"path"`
-	Repo      string    `json:"repo"`
-	RepoName  string    `json:"repoName"`
-	Branch    string    `json:"branch,omitempty"`
-	Tool      string    `json:"tool"`
-	State     string    `json:"state"`
-	Locked    bool      `json:"locked"`
-	SizeBytes int64     `json:"sizeBytes"`
-	LastUsed  time.Time `json:"lastUsed,omitzero"`
-	Changes   int       `json:"uncommittedChanges"`
-	Unpushed  int       `json:"unpushedCommits"`
-}
-
-var stateNames = map[wt.State]string{wt.StateOK: "ok", wt.StateMissing: "missing", wt.StateOrphaned: "orphaned"}
-
-func report(ctx context.Context, opts wt.ScanOptions, asJSON bool) error {
-	var mu sync.Mutex
-	var worktrees []wt.Worktree
-	wt.Scan(ctx, opts, func(w wt.Worktree) {
-		mu.Lock()
-		worktrees = append(worktrees, w)
-		mu.Unlock()
-	})
-
-	entries := make([]entry, len(worktrees))
-	var wg sync.WaitGroup
-	slots := make(chan struct{}, 8)
-	for i, w := range worktrees {
-		wg.Go(func() {
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			e := entry{Path: w.Path, Repo: w.RepoPath, RepoName: w.RepoName, Branch: w.Branch, Tool: w.Tool, State: stateNames[w.State], Locked: w.Locked}
-			if w.State != wt.StateMissing {
-				if usage, err := wt.MeasureUsage(ctx, w.Path); err == nil {
-					e.SizeBytes, e.LastUsed = usage.Bytes, usage.LatestChange
-				}
-			}
-
-			if info, err := wt.InspectGit(ctx, w); err == nil {
-				e.Changes, e.Unpushed = info.Changes, info.Unpushed
-				if info.LastCommit.After(e.LastUsed) {
-					e.LastUsed = info.LastCommit
-				}
-			}
-
-			entries[i] = e
-		})
-	}
-
-	wg.Wait()
-	slices.SortFunc(entries, func(a, b entry) int { return cmp.Compare(b.SizeBytes, a.SizeBytes) })
-
-	if asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(entries)
-	}
-
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "TOOL\tREPO\tBRANCH\tPATH\tSIZE\tLAST USED\tSTATUS")
-	for _, e := range entries {
-		last := "-"
-		if !e.LastUsed.IsZero() {
-			last = ui.FormatAge(e.LastUsed, time.Now())
-		}
-
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", e.Tool, e.RepoName, e.Branch,
-			ui.Tildify(e.Path), ui.FormatBytes(e.SizeBytes), last, statusText(e))
-	}
-
-	return tw.Flush()
-}
-
-func statusText(e entry) string {
-	var parts []string
-	if e.State != "ok" {
-		parts = append(parts, e.State)
-	}
-
-	if e.Locked {
-		parts = append(parts, "locked")
-	}
-
-	if e.Changes > 0 {
-		parts = append(parts, fmt.Sprintf("%d changed", e.Changes))
-	}
-
-	if e.Unpushed > 0 {
-		parts = append(parts, fmt.Sprintf("%d unpushed", e.Unpushed))
-	}
-
-	if len(parts) == 0 {
-		return "clean"
-	}
-
-	return strings.Join(parts, ", ")
 }

@@ -63,7 +63,7 @@ func scanAll(t *testing.T, roots []string, home string) map[string]Worktree {
 	t.Helper()
 	var mu sync.Mutex
 	found := map[string]Worktree{}
-	Scan(context.Background(), ScanOptions{Roots: roots, Home: home, Workers: 4}, func(w Worktree) {
+	NewScanner(ScanOptions{Roots: roots, Home: home}, func(w Worktree) {
 		mu.Lock()
 		defer mu.Unlock()
 		if _, dup := found[w.Path]; dup {
@@ -71,7 +71,7 @@ func scanAll(t *testing.T, roots []string, home string) map[string]Worktree {
 		}
 
 		found[w.Path] = w
-	})
+	}).Run(context.Background())
 	return found
 }
 
@@ -233,7 +233,7 @@ func TestRemove(t *testing.T) {
 	}
 }
 
-func TestMeasureUsageCountsHardLinksOnce(t *testing.T) {
+func TestMeasureUsageLeavesOutHardLinks(t *testing.T) {
 	root := tempRoot(t)
 	big := make([]byte, 64*1024)
 	write(t, filepath.Join(root, "a"), string(big))
@@ -242,7 +242,9 @@ func TestMeasureUsageCountsHardLinksOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.Link(filepath.Join(root, "a"), filepath.Join(root, "b")); err != nil {
+	// Like pnpm linking from its store: deleting the worktree frees nothing.
+	store := tempRoot(t)
+	if err := os.Link(filepath.Join(root, "a"), filepath.Join(store, "a")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -251,7 +253,7 @@ func TestMeasureUsageCountsHardLinksOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if before.Bytes < int64(len(big)) || after.Bytes != before.Bytes {
+	if before.Bytes < int64(len(big)) || after.Bytes >= int64(len(big)) {
 		t.Errorf("before %d, after %d", before.Bytes, after.Bytes)
 	}
 
@@ -261,19 +263,24 @@ func TestMeasureUsageCountsHardLinksOnce(t *testing.T) {
 }
 
 func TestToolFor(t *testing.T) {
+	t.Setenv("CODEX_HOME", "/opt/codex")
 	cases := map[string]string{
-		"/u/.claude/worktrees/x":    "Claude",
-		"/u/.claude-worktrees/r/x":  "Claude",
-		"/u/.cursor/worktrees/r/x":  "Cursor",
-		"/u/.codex/worktrees/abc/r": "Codex",
-		"/u/conductor/workspaces/r": "Conductor",
-		"/u/proj/.conductor/tokyo":  "Conductor",
-		"/u/.t3/worktrees/r/x":      "T3",
-		"/u/dev/app-feature":        "git",
+		"/u/.claude/worktrees/x":            "Claude",
+		"/u/proj/.claude/worktrees/x":       "Claude",
+		"/u/.claude-worktrees/r/x":          "Claude",
+		"/u/.cursor/worktrees/r/x":          "Cursor",
+		"/u/.codex/worktrees/abc/r":         "Codex",
+		"/opt/codex/worktrees/abc/r":        "Codex",
+		"/u/conductor/workspaces/r":         "Conductor",
+		"/u/code/conductor/r":               "git",
+		"/u/proj/.conductor/tokyo":          "Conductor",
+		"/u/.t3/worktrees/r/x":              "T3",
+		"/u/dev/app-feature":                "git",
+		"/u/.claude-worktrees-old/whatever": "git",
 	}
 
 	for path, want := range cases {
-		if got := ToolFor(path); got != want {
+		if got := ToolFor(path, "/u"); got != want {
 			t.Errorf("ToolFor(%q) = %q, want %q", path, got, want)
 		}
 	}

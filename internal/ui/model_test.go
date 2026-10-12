@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -37,10 +38,13 @@ func fixture(t *testing.T) (clean, dirty wt.Worktree) {
 	git(t, repo, "worktree", "add", "-q", "-b", "dirty-branch", filepath.Join(root, "b-dirty"))
 	os.WriteFile(filepath.Join(root, "b-dirty", "README"), []byte("edited\n"), 0o644)
 
+	var mu sync.Mutex
 	found := map[string]wt.Worktree{}
-	wt.Scan(context.Background(), wt.ScanOptions{Roots: []string{root}, Home: root}, func(w wt.Worktree) {
+	wt.NewScanner(wt.ScanOptions{Roots: []string{root}, Home: root}, func(w wt.Worktree) {
+		mu.Lock()
+		defer mu.Unlock()
 		found[filepath.Base(w.Path)] = w
-	})
+	}).Run(context.Background())
 	return found["a-clean"], found["b-dirty"]
 }
 
@@ -86,7 +90,7 @@ func screen(m *Model) string { return ansi.Strip(m.View().Content) }
 
 func newModel(t *testing.T, worktrees ...wt.Worktree) *Model {
 	t.Helper()
-	m := New(context.Background(), "test", "/", func() int64 { return 0 })
+	m := New(context.Background(), Options{Title: "test", Cwd: "/", Visited: func() int64 { return 0 }})
 	drive(m, tea.WindowSizeMsg{Width: 160, Height: 20})
 	m.sort = sortRepo
 	for _, w := range worktrees {
@@ -193,5 +197,59 @@ func TestFilter(t *testing.T) {
 	drive(m, key("enter"))
 	if !strings.Contains(screen(m), "Delete "+Tildify(dirty.Path)) {
 		t.Fatalf("wrong delete target:\n%s", screen(m))
+	}
+}
+
+func TestDeleteWaitsForGitStatus(t *testing.T) {
+	clean, _ := fixture(t)
+	m := newModel(t)
+	// Add the row without running its background commands.
+	m.Update(FoundMsg{Worktree: clean})
+
+	drive(m, key("enter"))
+	if m.confirming != nil {
+		t.Fatal("delete prompt shown before git status loaded")
+	}
+
+	if !strings.Contains(screen(m), "still checking git status") {
+		t.Errorf("no notice:\n%s", screen(m))
+	}
+}
+
+func TestPromptCountsSelectionsHiddenByFilter(t *testing.T) {
+	clean, dirty := fixture(t)
+	m := newModel(t, clean, dirty)
+
+	drive(m, key("space"))
+	drive(m, key("down"))
+	drive(m, key("space"))
+	drive(m, key("/"))
+	for _, r := range "dirty" {
+		drive(m, key(string(r)))
+	}
+
+	drive(m, key("enter"))
+	drive(m, key("enter"))
+	if view := screen(m); !strings.Contains(view, "Delete 2 worktrees") || !strings.Contains(view, "1 hidden by the filter") {
+		t.Fatalf("hidden selection not shown:\n%s", view)
+	}
+}
+
+func TestPromptWarnsAboutCommitsOnNoBranch(t *testing.T) {
+	m := newModel(t)
+	w := wt.Worktree{Path: "/tmp/detached", RepoName: "app", Head: "abc1234def"}
+	m.Update(FoundMsg{Worktree: w})
+	m.Update(usageMsg{path: w.Path})
+	m.Update(gitMsg{path: w.Path, info: wt.GitInfo{Unpushed: 2}})
+
+	drive(m, key("enter"))
+	if view := screen(m); !strings.Contains(view, "1 with commits on no branch (will be lost)") {
+		t.Fatalf("no warning:\n%s", view)
+	}
+}
+
+func TestSanitize(t *testing.T) {
+	if got := Sanitize("a\x1b[2Jb‮c\td"); got != "a?[2Jb?c?d" {
+		t.Errorf("Sanitize = %q", got)
 	}
 }

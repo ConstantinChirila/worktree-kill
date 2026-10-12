@@ -6,8 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/ConstantinChirila/worktree-kill/internal/wt"
 )
 
+// FormatBytes renders a byte count like "1.5 GB".
 func FormatBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
@@ -28,6 +32,7 @@ func FormatBytes(n int64) string {
 	return fmt.Sprintf("%.1f %s", value, suffix)
 }
 
+// FormatAge renders how long before now t was, like "3d ago".
 func FormatAge(t, now time.Time) string {
 	d := now.Sub(t)
 	switch {
@@ -48,8 +53,18 @@ func FormatAge(t, now time.Time) string {
 	}
 }
 
-var home, _ = os.UserHomeDir()
+// home is the canonical home folder, or empty if it can't be found, in which
+// case Tildify leaves paths alone.
+var home = func() string {
+	dir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
 
+	return wt.CanonicalPath(dir)
+}()
+
+// Tildify shortens a path inside the home folder to start with "~".
 func Tildify(path string) string {
 	if home == "" {
 		return path
@@ -64,6 +79,60 @@ func Tildify(path string) string {
 	}
 
 	return path
+}
+
+// Sanitize replaces control and bidi-override characters with "?", so a
+// crafted path, branch or git message can't send escape codes to the terminal.
+func Sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Bidi_Control, r) {
+			return '?'
+		}
+
+		return r
+	}, s)
+}
+
+// StatusParts describes a worktree for the STATUS column, like
+// ["locked", "2 changed"]. info is nil while git status is loading. No parts
+// means clean.
+func StatusParts(w wt.Worktree, info *wt.GitInfo) []string {
+	var parts []string
+	switch w.State {
+	case wt.StateMissing:
+		parts = append(parts, "dir missing")
+	case wt.StateOrphaned:
+		parts = append(parts, "orphaned")
+	}
+
+	if w.Locked {
+		parts = append(parts, "locked")
+	}
+
+	if info != nil && info.Changes > 0 {
+		parts = append(parts, fmt.Sprintf("%d changed", info.Changes))
+	}
+
+	if info != nil && info.Unpushed > 0 {
+		parts = append(parts, fmt.Sprintf("%d unpushed", info.Unpushed))
+	}
+
+	return parts
+}
+
+// LastUsed is the newer of the last file change and the last commit. Either
+// may be nil while loading.
+func LastUsed(usage *wt.Usage, info *wt.GitInfo) time.Time {
+	var t time.Time
+	if usage != nil {
+		t = usage.LatestChange
+	}
+
+	if info != nil && info.LastCommit.After(t) {
+		t = info.LastCommit
+	}
+
+	return t
 }
 
 // truncEnd cuts the end of s to fit width display cells.

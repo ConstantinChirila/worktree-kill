@@ -24,6 +24,19 @@ const (
 	StateOrphaned
 )
 
+// String returns the state's identifier, as used in JSON output.
+func (s State) String() string {
+	switch s {
+	case StateMissing:
+		return "missing"
+	case StateOrphaned:
+		return "orphaned"
+	default:
+		return "ok"
+	}
+}
+
+// Worktree is a linked worktree, found on disk or in a repo's metadata.
 type Worktree struct {
 	Path string
 	// GitDir is the per-worktree admin dir, usually <repo>/.git/worktrees/<name>.
@@ -34,12 +47,15 @@ type Worktree struct {
 	RepoPath string
 	RepoName string
 	// Branch is the short branch name, empty when HEAD is detached.
-	Branch     string
-	Head       string
-	Locked     bool
+	Branch string
+	// Head is the commit hash when HEAD is detached.
+	Head   string
+	Locked bool
+	// LockReason is restored if a locked worktree fails to be removed.
 	LockReason string
 	State      State
-	Tool       string
+	// Tool guesses which tool made the worktree. Set by the scanner.
+	Tool string
 }
 
 var errNotLinkedWorktree = errors.New("not a linked worktree")
@@ -64,8 +80,7 @@ func fromDotGitFile(dir string) (Worktree, error) {
 
 	gitDir = filepath.Clean(gitDir)
 	if _, err := os.Stat(gitDir); errors.Is(err, os.ErrNotExist) {
-		// Only call it orphaned if the path looks like a worktree admin dir.
-		if filepath.Base(filepath.Dir(gitDir)) != "worktrees" {
+		if !repoDeleted(gitDir) {
 			return Worktree{}, errNotLinkedWorktree
 		}
 
@@ -74,11 +89,33 @@ func fromDotGitFile(dir string) (Worktree, error) {
 			GitDir:   gitDir,
 			RepoName: repoNameFromCommonDir(filepath.Dir(filepath.Dir(gitDir))),
 			State:    StateOrphaned,
-			Tool:     ToolFor(dir),
 		}, nil
 	}
 
 	return fromGitDir(dir, gitDir)
+}
+
+// repoDeleted reports whether a missing gitDir belonged to a repository that
+// was deleted, as opposed to one that is only out of reach. Orphans are
+// deleted outright, so this errs towards "no":
+//   - gitDir must look like a worktree admin dir (<repo>/.git/worktrees/<name>);
+//   - the repo's .git dir must be gone (if it exists, only git's entry for
+//     this worktree was removed and `git worktree repair` can relink it);
+//   - the folder the repo lived in must still exist. If that is gone too, the
+//     repo is more likely on an unmounted drive or inside a container.
+func repoDeleted(gitDir string) bool {
+	adminRoot := filepath.Dir(gitDir)
+	if filepath.Base(adminRoot) != "worktrees" {
+		return false
+	}
+
+	commonDir := filepath.Dir(adminRoot)
+	if _, err := os.Lstat(commonDir); !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+
+	info, err := os.Stat(filepath.Dir(repoPathFromCommonDir(commonDir)))
+	return err == nil && info.IsDir()
 }
 
 // fromGitDir builds a Worktree from its admin dir. path is the worktree checkout.
@@ -100,14 +137,12 @@ func fromGitDir(path, gitDir string) (Worktree, error) {
 		CommonDir: commonDir,
 		RepoPath:  repoPathFromCommonDir(commonDir),
 		RepoName:  repoNameFromCommonDir(commonDir),
-		Tool:      ToolFor(path),
 	}
 
 	if head, err := os.ReadFile(filepath.Join(gitDir, "HEAD")); err == nil {
-		value := strings.TrimSpace(string(head))
-		if ref, ok := strings.CutPrefix(value, "ref: "); ok {
+		if ref, ok := branchRef(head); ok {
 			w.Branch = strings.TrimPrefix(ref, "refs/heads/")
-		} else {
+		} else if value := strings.TrimSpace(string(head)); !strings.HasPrefix(value, "ref:") {
 			w.Head = value
 		}
 	}
@@ -122,6 +157,18 @@ func fromGitDir(path, gitDir string) (Worktree, error) {
 	}
 
 	return w, nil
+}
+
+// branchRef returns the branch a HEAD file points at, like "refs/heads/main".
+// It reports false for a detached HEAD or a ref outside refs/heads/, so a
+// crafted HEAD can't smuggle git options into later commands.
+func branchRef(head []byte) (string, bool) {
+	ref, ok := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: ")
+	if !ok || !strings.HasPrefix(ref, "refs/heads/") {
+		return "", false
+	}
+
+	return ref, true
 }
 
 // worktreesOfRepo lists linked worktrees registered in a repo's shared .git dir.
@@ -144,9 +191,14 @@ func worktreesOfRepo(commonDir string) []Worktree {
 			continue
 		}
 
-		// The gitdir file holds the path of the worktree's `.git` file.
-		path := filepath.Dir(filepath.Clean(strings.TrimSpace(string(pointer))))
-		if w, err := fromGitDir(path, gitDir); err == nil {
+		// The gitdir file holds the path of the worktree's `.git` file. With
+		// worktree.useRelativePaths (git 2.48+) it is relative to gitDir.
+		dotGit := strings.TrimSpace(string(pointer))
+		if !filepath.IsAbs(dotGit) {
+			dotGit = filepath.Join(gitDir, dotGit)
+		}
+
+		if w, err := fromGitDir(filepath.Dir(filepath.Clean(dotGit)), gitDir); err == nil {
 			result = append(result, w)
 		}
 	}
@@ -166,21 +218,18 @@ func repoNameFromCommonDir(commonDir string) string {
 	return strings.TrimSuffix(filepath.Base(repoPathFromCommonDir(commonDir)), ".git")
 }
 
-// ToolFor guesses which tool created a worktree from where it lives.
-func ToolFor(path string) string {
-	p := filepath.ToSlash(path) + "/"
-	switch {
-	case strings.Contains(p, "/.claude/worktrees/"), strings.Contains(p, "/.claude-worktrees/"):
-		return "Claude"
-	case strings.Contains(p, "/.cursor/worktrees/"):
-		return "Cursor"
-	case strings.Contains(p, "/.codex/worktrees/"):
-		return "Codex"
-	case strings.Contains(p, "/conductor/"), strings.Contains(p, "/.conductor/"):
-		return "Conductor"
-	case strings.Contains(p, "/.t3/worktrees/"):
-		return "T3"
-	default:
-		return "git"
+// CanonicalPath resolves symlinks in path, falling back to cleaning it when
+// it can't be resolved. Scanned paths are canonical, so compare against these.
+func CanonicalPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
 	}
+
+	return filepath.Clean(path)
+}
+
+// within reports whether path is dir or inside it. Both must be clean.
+func within(path, dir string) bool {
+	sep := string(filepath.Separator)
+	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, sep)+sep)
 }

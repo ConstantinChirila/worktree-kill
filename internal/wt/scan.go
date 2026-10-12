@@ -5,33 +5,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
 
-// KnownDirs returns locations where AI coding tools keep worktrees. They are
-// scanned first so results appear immediately, and they matter because the
-// main walk skips hidden directories.
-func KnownDirs(home string) []string {
-	dirs := []string{
-		filepath.Join(home, ".claude-worktrees"),
-		filepath.Join(home, ".cursor", "worktrees"),
-		filepath.Join(home, ".codex", "worktrees"),
-		filepath.Join(home, "conductor"),
-		filepath.Join(home, ".t3", "worktrees"),
-	}
-
-	if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
-		dirs = append(dirs, filepath.Join(codexHome, "worktrees"))
-	}
-
-	return dirs
-}
-
 // skipDir reports whether the walk should not descend into a directory.
 // Hidden directories are skipped: repo-internal locations like .claude/worktrees
-// are found through the repo's own metadata, and tool locations via KnownDirs.
+// are found through the repo itself, and tool locations via KnownDirs.
 func skipDir(parent, name, home string) bool {
 	if strings.HasPrefix(name, ".") {
 		return true
@@ -53,17 +35,30 @@ func skipDir(parent, name, home string) bool {
 	return false
 }
 
+// ScanOptions configures a Scanner. Paths should be canonical (see CanonicalPath).
 type ScanOptions struct {
 	Roots []string
 	Home  string
-	// Workers caps concurrent directory reads. Defaults to a multiple of NumCPU.
-	Workers int
 }
 
+// Protected returns the paths that must never be deleted outright, nor any
+// folder containing them: the scan roots and the home folder.
+func (o ScanOptions) Protected() []string {
+	protected := slices.Clone(o.Roots)
+	if o.Home != "" {
+		protected = append(protected, o.Home)
+	}
+
+	return protected
+}
+
+// Scanner walks folders looking for worktrees, reading many folders at once.
 type Scanner struct {
-	opts    ScanOptions
-	found   func(Worktree)
-	visited atomic.Int64
+	opts      ScanOptions
+	protected []string
+	found     func(Worktree)
+	workers   int
+	visited   atomic.Int64
 
 	mu      sync.Mutex
 	seen    map[string]bool
@@ -73,24 +68,16 @@ type Scanner struct {
 	cond    *sync.Cond
 }
 
-// Scan walks the roots and calls found (from multiple goroutines) for each
-// distinct worktree. It returns when the walk finishes or ctx is cancelled.
-func Scan(ctx context.Context, opts ScanOptions, found func(Worktree)) *Scanner {
-	s := NewScanner(opts, found)
-	s.Run(ctx)
-	return s
-}
-
+// NewScanner returns a Scanner that calls found (from multiple goroutines)
+// once for each distinct worktree.
 func NewScanner(opts ScanOptions, found func(Worktree)) *Scanner {
-	if opts.Workers <= 0 {
-		opts.Workers = runtime.NumCPU() * 4
-	}
-
 	s := &Scanner{
-		opts:  opts,
-		found: found,
-		seen:  map[string]bool{},
-		repos: map[string]bool{},
+		opts:      opts,
+		protected: opts.Protected(),
+		found:     found,
+		workers:   runtime.NumCPU() * 4,
+		seen:      map[string]bool{},
+		repos:     map[string]bool{},
 	}
 	s.cond = sync.NewCond(&s.mu)
 	return s
@@ -99,6 +86,7 @@ func NewScanner(opts ScanOptions, found func(Worktree)) *Scanner {
 // Visited is the number of directories read so far. Safe to call concurrently.
 func (s *Scanner) Visited() int64 { return s.visited.Load() }
 
+// Run walks the roots. It returns when the walk finishes or ctx is cancelled.
 func (s *Scanner) Run(ctx context.Context) {
 	// The stack is LIFO, so push in reverse to read the first root first.
 	for i := len(s.opts.Roots) - 1; i >= 0; i-- {
@@ -106,7 +94,7 @@ func (s *Scanner) Run(ctx context.Context) {
 	}
 
 	var wg sync.WaitGroup
-	for range s.opts.Workers {
+	for range s.workers {
 		wg.Go(func() {
 			for {
 				dir, ok := s.pop(ctx)
@@ -188,8 +176,15 @@ func (s *Scanner) visit(dir string) {
 			}
 		}
 
-		// Repos and worktrees are leaves: anything nested inside a repo that
-		// matters (like .claude/worktrees) is registered in its metadata.
+		// Repos and worktrees are leaves: worktrees nested inside them are
+		// registered in the repo's metadata. Tool folders are still walked,
+		// to find orphans there that git no longer knows about.
+		for _, sub := range repoToolDirs() {
+			if info, err := os.Lstat(filepath.Join(dir, sub)); err == nil && info.IsDir() {
+				s.push(filepath.Join(dir, sub))
+			}
+		}
+
 		return
 	}
 
@@ -219,19 +214,36 @@ func (s *Scanner) reportRepo(commonDir string) {
 
 func (s *Scanner) report(w Worktree) {
 	// Report one spelling per directory (macOS /tmp is a symlink to /private/tmp).
-	if resolved, err := filepath.EvalSymlinks(w.Path); err == nil {
-		w.Path = resolved
+	w.Path = CanonicalPath(w.Path)
+	if w.State == StateOrphaned && containsProtected(w.Path, s.protected) {
+		return
 	}
 
-	key := w.Path
+	w.Tool = ToolFor(w.Path, s.opts.Home)
 
 	s.mu.Lock()
-	if s.seen[key] {
+	if s.seen[w.Path] {
 		s.mu.Unlock()
 		return
 	}
 
-	s.seen[key] = true
+	s.seen[w.Path] = true
 	s.mu.Unlock()
 	s.found(w)
+}
+
+// containsProtected reports whether deleting dir would delete a protected
+// path, or dir is a filesystem root.
+func containsProtected(dir string, protected []string) bool {
+	if filepath.Dir(dir) == dir {
+		return true
+	}
+
+	for _, p := range protected {
+		if within(CanonicalPath(p), dir) {
+			return true
+		}
+	}
+
+	return false
 }
