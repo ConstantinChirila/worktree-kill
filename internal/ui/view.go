@@ -196,7 +196,7 @@ func (m *Model) renderRow(r *row, l layout, isCursor bool) string {
 }
 
 // details returns detailsHeight lines describing the highlighted row in full:
-// its path, wrapped, then what the table cuts off or doesn't show.
+// its branch, its path, wrapped, then what the table cuts off or doesn't show.
 func (m *Model) details(rows []*row) []string {
 	lines := make([]string, m.detailsHeight())
 	if len(lines) == 0 || len(rows) == 0 {
@@ -205,16 +205,25 @@ func (m *Model) details(rows []*row) []string {
 
 	r := rows[m.cursorIndex(rows)]
 	width := max(20, m.width-2)
+	// The branch gets its own line: the table cuts it, and branch names often
+	// differ only at the end.
+	switch {
+	case r.Branch != "":
+		lines[0] = "  " + dim.Render("branch ") + blue.Render(truncEnd(Sanitize(r.Branch), width-len("branch ")))
+	case r.Head != "":
+		lines[0] = "  " + dim.Render("detached at "+r.Head[:min(7, len(r.Head))])
+	}
+
 	// A path longer than two lines keeps its end, the informative part.
 	path := truncStart(Sanitize(Tildify(r.Path)), 2*width)
 	wrapped := strings.Split(ansi.Hardwrap(path, width, true), "\n")
 	n := min(2, len(wrapped))
 	for i := range n {
-		lines[i] = "  " + wrapped[i]
+		lines[1+i] = "  " + wrapped[i]
 	}
 
 	// Facts go right under the path; a short path leaves the last line blank.
-	lines[n] = "  " + dim.Render(truncEnd(Sanitize(strings.Join(r.facts(), " · ")), width))
+	lines[1+n] = "  " + dim.Render(truncEnd(Sanitize(strings.Join(r.facts(), " · ")), width))
 	return lines
 }
 
@@ -245,13 +254,6 @@ func (r *row) facts() []string {
 
 	if why := r.whyNotDeletable(); r.active() && why != "" && r.gitErr == nil {
 		facts = append(facts, why)
-	}
-
-	switch {
-	case r.Branch != "":
-		facts = append(facts, "branch "+r.Branch)
-	case r.Head != "":
-		facts = append(facts, "detached at "+r.Head[:min(7, len(r.Head))])
 	}
 
 	switch {

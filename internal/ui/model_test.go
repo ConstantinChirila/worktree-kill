@@ -424,3 +424,20 @@ func TestViewFitsTheTerminal(t *testing.T) {
 		t.Error("details hidden on a 12-line terminal")
 	}
 }
+
+func TestDetailsAlwaysShowFullBranch(t *testing.T) {
+	m := New(context.Background(), Options{Title: "~", Visited: func() int64 { return 0 }})
+	drive(m, tea.WindowSizeMsg{Width: 80, Height: 16})
+	branch := "claude/fix-the-scanner-so-it-skips-network-mounts-x7k2"
+	w := wt.Worktree{Path: "/r/.claude/worktrees/x7k2", RepoName: "r", Branch: branch,
+		Locked: true, LockReason: "claude agent agent-1234 (pid 5678) is running in this worktree"}
+	m.Update(FoundMsg{Worktree: w})
+	m.Update(usageMsg{path: w.Path})
+	m.Update(gitMsg{path: w.Path, info: wt.GitInfo{Ignored: []string{".env", ".env.local", "secrets.json"}}})
+	drive(m, ScanDoneMsg{})
+
+	// The table cuts the branch and the facts line is full; it must still show.
+	if view := screen(m); !strings.Contains(view, branch) {
+		t.Errorf("full branch %q not shown:\n%s", branch, view)
+	}
+}

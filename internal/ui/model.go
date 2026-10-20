@@ -352,9 +352,10 @@ func (m *Model) listHeight() int {
 }
 
 // detailsLines is the height of the details block under the list: the full
-// path (up to two lines) and one line of facts the table leaves out. It has a
-// fixed height so the list doesn't shift as the cursor moves.
-const detailsLines = 3
+// branch, the full path (up to two lines) and one line of facts the table
+// leaves out. It has a fixed height so the list doesn't shift as the cursor
+// moves.
+const detailsLines = 4
 
 // detailsHeight is 0 when showing the details would leave fewer than three
 // rows, where the rows matter more.
