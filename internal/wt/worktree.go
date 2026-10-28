@@ -17,11 +17,11 @@ import (
 type State int
 
 const (
-	// StateOK: directory and git admin entry both exist.
+	// StateOK means the directory and git admin entry both exist.
 	StateOK State = iota
-	// StateMissing: git still tracks the worktree but its directory is gone.
+	// StateMissing means git still tracks the worktree but its directory is gone.
 	StateMissing
-	// StateOrphaned: the directory exists but the repo it belonged to is gone.
+	// StateOrphaned means the directory exists but the repo it belonged to is gone.
 	StateOrphaned
 )
 

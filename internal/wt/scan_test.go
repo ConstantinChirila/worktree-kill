@@ -102,15 +102,15 @@ func TestRelativeGitdirPointers(t *testing.T) {
 func TestForgedEntryDoesNotHideRealWorktree(t *testing.T) {
 	root := tempRoot(t)
 	app := newRepo(t, root, "app")
-	real := filepath.Join(root, "wt")
-	run(t, app, "worktree", "add", "-q", "-b", "wt", real)
+	genuine := filepath.Join(root, "wt")
+	run(t, app, "worktree", "add", "-q", "-b", "wt", genuine)
 
 	// Another repo registers entries pointing at app's worktree and at a
 	// plain folder.
 	evil := newRepo(t, root, "evil")
 	precious := filepath.Join(root, "precious")
 	write(t, filepath.Join(precious, "keep.txt"), "x")
-	for name, target := range map[string]string{"fake": real, "plain": precious} {
+	for name, target := range map[string]string{"fake": genuine, "plain": precious} {
 		admin := filepath.Join(evil, ".git", "worktrees", name)
 		write(t, filepath.Join(admin, "gitdir"), filepath.Join(target, ".git")+"\n")
 		write(t, filepath.Join(admin, "commondir"), "../..\n")
@@ -119,7 +119,7 @@ func TestForgedEntryDoesNotHideRealWorktree(t *testing.T) {
 
 	// Scan evil first so its entries would win the path dedupe.
 	found := scanAll(t, []string{evil, root}, root)
-	if w := found[real]; w.RepoName != "app" {
+	if w := found[genuine]; w.RepoName != "app" {
 		t.Errorf("real worktree shown as %+v", w)
 	}
 

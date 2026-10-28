@@ -103,16 +103,7 @@ func TestRepoGpgProgramIsNotRun(t *testing.T) {
 		"gpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n\nsigned\n"
 	cmd := exec.Command("git", "hash-object", "-t", "commit", "-w", "--stdin")
 	cmd.Dir = path
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	go func() {
-		defer stdin.Close()
-		stdin.Write([]byte(commit))
-	}()
-
+	cmd.Stdin = strings.NewReader(commit)
 	hash, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)

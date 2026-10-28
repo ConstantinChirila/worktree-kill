@@ -30,14 +30,22 @@ func fixture(t *testing.T) (clean, dirty wt.Worktree) {
 	t.Helper()
 	root, _ := filepath.EvalSymlinks(t.TempDir())
 	repo := filepath.Join(root, "app")
-	os.MkdirAll(repo, 0o755)
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	git(t, repo, "init", "-q")
-	os.WriteFile(filepath.Join(repo, "README"), []byte("hi\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(repo, "README"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "init")
 	git(t, repo, "worktree", "add", "-q", "-b", "clean-branch", filepath.Join(root, "a-clean"))
 	git(t, repo, "worktree", "add", "-q", "-b", "dirty-branch", filepath.Join(root, "b-dirty"))
-	os.WriteFile(filepath.Join(root, "b-dirty", "README"), []byte("edited\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(root, "b-dirty", "README"), []byte("edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	var mu sync.Mutex
 	found := map[string]wt.Worktree{}
@@ -252,7 +260,7 @@ func TestPromptWarnsAboutCommitsOnNoBranch(t *testing.T) {
 }
 
 func TestSanitize(t *testing.T) {
-	if got := Sanitize("a\x1b[2Jb‮c\td"); got != "a?[2Jb?c?d" {
+	if got := Sanitize("a\x1b[2Jb\u202ec\td"); got != "a?[2Jb?c?d" {
 		t.Errorf("Sanitize = %q", got)
 	}
 }

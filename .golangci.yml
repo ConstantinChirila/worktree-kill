@@ -1,0 +1,18 @@
+version: "2"
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    # Its default rules include `exported`: exported names need a doc comment.
+    - revive
+    - misspell
+  exclusions:
+    presets:
+      # Unchecked errors from Close, Flush, fmt.Print and the like.
+      - std-error-handling
+      - common-false-positives
+
+formatters:
+  enable:
+    - gofmt
