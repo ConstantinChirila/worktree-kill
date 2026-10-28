@@ -133,3 +133,13 @@ worktreekill runs git in every worktree it finds, and git reads each repo's own 
 - `GIT_DIR`, `GIT_WORK_TREE` and similar variables, if worktreekill is started from inside a git hook.
 
 Submodules have their own config, so `git status` skips them: changes inside a submodule aren't counted, and the delete prompt says when a worktree has populated submodules. This needs git 2.26 or newer; with older git, status fails and those worktrees can't be deleted from the tool.
+
+## Contributing
+
+CI runs the tests and [golangci-lint](https://golangci-lint.run) on every pull request. To run the same checks locally:
+
+```sh
+go test ./...
+brew install golangci-lint   # or see golangci-lint.run for other installs
+golangci-lint run
+```
