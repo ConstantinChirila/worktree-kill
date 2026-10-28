@@ -1,3 +1,4 @@
 .gomodcache/
 dist/
 .claude/
+.DS_Store
