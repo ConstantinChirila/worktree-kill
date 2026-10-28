@@ -1,7 +1,5 @@
 package wt
 
-// Helpers shared by the tests in this package.
-
 import (
 	"context"
 	"os"

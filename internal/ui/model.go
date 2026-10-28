@@ -146,7 +146,6 @@ type Model struct {
 	width, height int
 	summary       Summary
 
-	// Limits for background work.
 	usageLimit   limit.Limit
 	gitLimit     limit.Limit
 	removalLimit limit.Limit

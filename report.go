@@ -76,7 +76,6 @@ func report(ctx context.Context, opts wt.ScanOptions, asJSON bool) error {
 	return tw.Flush()
 }
 
-// limits caps concurrent size walks and git inspections.
 type limits struct{ usage, git limit.Limit }
 
 // measure gets a worktree's size and git status, in parallel.

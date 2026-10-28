@@ -115,7 +115,6 @@ func gitCommand(ctx context.Context, args []string) (*exec.Cmd, *bytes.Buffer) {
 	return cmd, stderr
 }
 
-// gitFailure turns a failed run into git's own message.
 func gitFailure(err error, stderr *bytes.Buffer) error {
 	msg := strings.TrimSpace(stderr.String())
 	if msg == "" {

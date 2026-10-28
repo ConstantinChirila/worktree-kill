@@ -135,7 +135,6 @@ func repoDeleted(dir, gitDir string) bool {
 	return err == nil && info.IsDir()
 }
 
-// fromGitDir builds a Worktree from its admin dir. path is the worktree checkout.
 func fromGitDir(path, gitDir string) (Worktree, error) {
 	commonRel, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
 	if err != nil {
@@ -188,7 +187,6 @@ func branchRef(head []byte) (string, bool) {
 	return ref, true
 }
 
-// worktreesOfRepo lists linked worktrees registered in a repo's shared .git dir.
 func worktreesOfRepo(commonDir string) []Worktree {
 	adminRoot := filepath.Join(commonDir, "worktrees")
 	entries, err := os.ReadDir(adminRoot)
